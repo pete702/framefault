@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CrashContext>
+  <RuntimeProperties>
+    <crashtype>Crash</crashtype>
+    <gamename>TestGame</gamename>
+    <engineversion>5.3.2-26560700</engineversion>
+    <buildconfiguration>Shipping</buildconfiguration>
+    <enginemode>Game</enginemode>
+    <isensure>false</isensure>
+    <isassert>false</isassert>
+    <cpubrand>AMD Ryzen 9 7950X</cpubrand>
+    <gpubrand>NVIDIA GeForce RTX 4090</gpubrand>
+    <totalphysicalram>34359738368</totalphysicalram>
+    <bisOOM>true</bisOOM>
+    <errormessage>Fatal error: Out of video memory trying to allocate a rendering resource</errormessage>
+    <CallStack></CallStack>
+  </RuntimeProperties>
+</CrashContext>

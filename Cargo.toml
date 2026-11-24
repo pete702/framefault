@@ -1,0 +1,37 @@
+[package]
+name = "framefault"
+version = "0.1.2"
+edition = "2021"
+description = "One crash verdict per incident — read-only, no-admin Windows game crash diagnostics"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "links", "clipboard"] }
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Registry",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_EventLog",
+  "Win32_System_SystemInformation",
+  "Win32_Graphics_Dxgi",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+quick-xml = "0.42"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+walkdir = "2"
+dirs = "7"
+clap = { version = "4", optional = true, features = ["derive"] }
+evtx = { version = "0.15", optional = true, default-features = false }
+
+[features]
+default = []
+cli = ["dep:clap"]
+evtx = ["dep:evtx"]
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

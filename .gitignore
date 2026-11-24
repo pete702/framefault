@@ -1,0 +1,7 @@
+/target
+*.exe
+*.pdb
+*.dmp
+.rustfmt.toml.bak
+.DS_Store
+.cargo/

@@ -1,0 +1,3 @@
+[2026.11.24-14.22.31] LogD3D12RHI: Error: GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006)
+[2026.11.24-14.22.31] LogWindows: Error: DirectX function "GetDeviceRemovedReason" failed
+[2026.11.24-14.22.31] LogExit: Exiting.

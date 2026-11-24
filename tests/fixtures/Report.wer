@@ -1,0 +1,11 @@
+Version=1
+EventType=ApplicationCrash
+ReportType=2
+Code=1000
+ProblemEventName=APPCRASH
+FaultingModule=nvlddmkm.sys
+ExceptionCode=0xc0000005
+LoadedModule[0]=C:\Windows\SYSTEM32\ntdll.dll
+LoadedModule[1]=C:\Windows\System32\dxgi.dll
+LoadedModule[2]=C:\Windows\System32\d3d12.dll
+LoadedModule[3]=C:\Program Files (x86)\RivaTuner Statistics Server\RTSSHooks64.dll

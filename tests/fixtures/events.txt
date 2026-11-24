@@ -1,0 +1,40 @@
+Event[0]:
+  Log Name: System
+  Source: nvlddmkm
+  Date: 2026-11-24T14:22:31.1230000Z
+  Event ID: 153
+  Level: Error
+  Error occurred on GPUID: 100
+
+Event[1]:
+  Log Name: System
+  Source: Display
+  Date: 2026-11-24T14:22:32.4560000Z
+  Event ID: 4101
+  Level: Warning
+  Display driver nvlddmkm stopped responding and has successfully recovered.
+
+Event[2]:
+  Log Name: System
+  Source: Microsoft-Windows-Resource-Exhaustion-Detector
+  Date: 2026-11-24T14:22:33.0000000Z
+  Event ID: 2004
+  Level: Warning
+  Windows successfully diagnosed a low virtual memory condition.
+
+Event[3]:
+  Log Name: System
+  Source: Microsoft-Windows-WHEA-Logger
+  Date: 2026-11-24T14:22:34.0000000Z
+  Event ID: 18
+  Level: Error
+  A fatal hardware error has occurred.
+
+Event[4]:
+  Log Name: System
+  Source: Microsoft-Windows-Kernel-Power
+  Date: 2026-11-24T14:22:35.0000000Z
+  Event ID: 41
+  Level: Critical
+  BugcheckCode 159
+  The system has rebooted without cleanly shutting down first.

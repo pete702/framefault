@@ -1,0 +1,208 @@
+version = 1
+window_sec = 15
+anchors = ["wer", "ue_xml", "unity_log", "game_log", "application_error_1000"]
+
+# ---------------------------------------------------------------------------
+# GPU driver resets (TDR). NVIDIA / AMD / Intel all land in different providers.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "tdr_nvidia_153"
+source = "eventlog"
+channel = "System"
+provider = "nvlddmkm"
+event_id = 153
+match_field = "detail"
+match_contains = "GPUID"
+weight = 40
+verdict = "NVIDIA GPU driver timeout (TDR) - the game did not crash on its own"
+confidence = "High"
+next_steps = ["Зніміть OC/undervolt GPU та пам'яті", "Перевірте версію драйвера", "Спробуйте вимкнути MPO"]
+link = "https://learn.microsoft.com/en-us/answers/questions/4307117/game-crash-with-the-description-for-event-id-0-fro"
+
+[[rules]]
+id = "tdr_amd_153"
+source = "eventlog"
+channel = "System"
+provider_any = ["amdkmdag", "amdwddmg", "amdkmdap"]
+event_id = 153
+weight = 40
+verdict = "AMD GPU driver timeout (TDR) - the game did not crash on its own"
+confidence = "High"
+next_steps = ["Вимкніть OC/undervolt", "Спробуйте WhisperMode/профіль стабільності Adrenalin", "Перевірте MPO"]
+link = "https://learn.microsoft.com/en-us/answers/questions/4174161/event-id-4101-display-driver-amdwddmg-stopped-resp"
+
+[[rules]]
+id = "tdr_intel_153"
+source = "eventlog"
+channel = "System"
+provider_any = ["igfxn", "igdkmdn64", "igdlh64"]
+event_id = 153
+weight = 40
+verdict = "Intel graphics driver timeout (TDR)"
+confidence = "High"
+next_steps = ["Перевірте драйвер Intel", "Вимкніть MPO", "Перевірте живлення/температуру"]
+link = "https://learn.microsoft.com/en-us/answers/questions/2319492/surface-laptop-3-event-4101-display-driver-igfxn-s"
+
+[[rules]]
+id = "display_4101"
+source = "eventlog"
+channel = "System"
+provider = "Display"
+event_id = 4101
+weight = 15
+verdict = "Display driver stopped responding and recovered (TDR)"
+confidence = "High"
+link = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/cc756372(v=ws.10)"
+
+# ---------------------------------------------------------------------------
+# Memory / commit / pagefile
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "pagefile_2004"
+source = "eventlog"
+channel = "System"
+provider = "Microsoft-Windows-Resource-Exhaustion-Detector"
+event_id = 2004
+weight = 35
+verdict = "Low virtual memory (commit) - check pagefile, not VRAM"
+confidence = "High"
+next_steps = ["Перевірте CommitLimit vs Commit у верхній панелі", "Збільште pagefile або закрийте memory-hungry процеси"]
+link = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-application-service-memory-leaks"
+
+[[rules]]
+id = "kernel_power_41"
+source = "eventlog"
+channel = "System"
+provider = "Microsoft-Windows-Kernel-Power"
+event_id = 41
+weight = 10
+verdict = "Unclean restart / bugcheck recorded (Kernel-Power 41)"
+confidence = "Medium"
+link = "https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart"
+
+[[rules]]
+id = "bugcheck_1001"
+source = "eventlog"
+channel = "System"
+provider_any = ["BugCheck", "Microsoft-Windows-WER-SystemErrorReporting"]
+event_id = 1001
+weight = 20
+verdict = "Blue screen recorded (BugCheck 1001)"
+confidence = "High"
+link = "https://learn.microsoft.com/en-us/answers/questions/5838090/event-1001-bugcheck"
+
+[[rules]]
+id = "application_error_1000"
+source = "eventlog"
+channel = "Application"
+provider = "Application Error"
+event_id = 1000
+weight = 10
+verdict = "Application crash recorded (Event 1000)"
+confidence = "Info"
+link = "https://learn.microsoft.com/en-us/troubleshoot/developer/webapps/iis/site-behavior-performance/process-termination-crash"
+
+# ---------------------------------------------------------------------------
+# Hardware
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "whea_hardware"
+source = "eventlog"
+channel = "System"
+provider = "Microsoft-Windows-WHEA-Logger"
+event_id_any = [17, 18, 19]
+weight = 35
+verdict = "Hardware / PCIe error (WHEA)"
+confidence = "High"
+next_steps = ["Перевірте PCIe-живлення та OC", "Перевірте температуру й кабелі"]
+link = "https://learn.microsoft.com/en-us/answers/questions/3844975/whea-logger-event-id-17-a-corrected-hardware-error"
+
+# ---------------------------------------------------------------------------
+# Unreal Engine - Shipping-safe fields first, CallStack is optional bonus.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "ue_oom_flag"
+source = "ue_xml"
+match_field = "bIsOOM"
+match_value = "true"
+weight = 35
+verdict = "Unreal flagged an out-of-memory condition"
+confidence = "High"
+
+[[rules]]
+id = "ue_out_of_video_memory"
+source = "ue_xml"
+match_field = "ErrorMessage"
+match_contains = "Out of video memory"
+weight = 30
+verdict = "UE VRAM allocation failed - often RAM/pagefile exhaustion in disguise"
+confidence = "Medium"
+
+[[rules]]
+id = "ue_fatal_or_ensure"
+source = "ue_xml"
+match_field = "CrashType"
+match_any = ["Crash", "Ensure", "Assert"]
+weight = 8
+verdict = "Unreal engine-level malfunction (0xE0000001 / 0xE0000002)"
+confidence = "Medium"
+
+# ---------------------------------------------------------------------------
+# Unity / generic game log / WER
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "unity_crash"
+source = "unity_log"
+match_any = ["Crash!!!", "OutOfMemoryException"]
+weight = 30
+verdict = "Unity player crash marker found in Player.log"
+confidence = "High"
+
+[[rules]]
+id = "dxgi_device_hung"
+source = "game_log"
+match_field = "detail"
+match_any = ["DXGI_ERROR_DEVICE_HUNG", "0x887A0006", "DXGI_ERROR_DEVICE_REMOVED", "0x887A0005"]
+weight = 20
+verdict = "Game lost the D3D device after a driver reset"
+confidence = "High"
+
+[[rules]]
+id = "live_kernel_141"
+source = "wer"
+match_field = "detail"
+match_contains = "141"
+weight = 25
+verdict = "LiveKernelEvent 141 - VIDEO_TDR without a full reboot"
+confidence = "High"
+link = "https://learn.microsoft.com/en-us/answers/questions/5918013/consistent-livekernelevent-141-errors-causing-game"
+
+[[rules]]
+id = "overlay_hook_in_wer"
+source = "wer"
+match_field = "LoadedModule"
+match_any = [
+  "RTSSHooks64.dll", "RTSSHooks.dll", "DiscordHook64.dll", "ow-graphics-vulkan.dll",
+  "SpecialK64.dll", "dxgi.dll", "d3d12.dll", "d3d11.dll", "nvspcap64.dll"
+]
+weight = 15
+verdict = "Third-party overlay/proxy DLL loaded into the game at crash time"
+confidence = "Medium"
+note = "Historical evidence from Report.wer. System32/SysWOW64 DXGI/D3D DLLs are ignored."
+
+[[rules]]
+id = "mpo_state"
+source = "registry"
+match_field = "value"
+match_value = "5"
+weight = 5
+verdict = "MPO status read from HKLM"
+verdict_if_enabled = "MPO likely enabled (OverlayTestMode absent or != 5)"
+verdict_if_disabled = "MPO disabled (OverlayTestMode = 5)"
+confidence = "Info"
+link = "https://learn.microsoft.com/en-us/windows/win32/dwm/dwm-overview"
