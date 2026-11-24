@@ -301,7 +301,10 @@ impl App {
                 .id_salt(format!("proof-{}", finding.verdict))
                 .show(ui, |ui| {
                     for line in &finding.evidence {
-                        ui.label(RichText::new(line).monospace().small());
+                        ui.add(
+                            egui::Label::new(RichText::new(line).monospace().small())
+                                .wrap_mode(egui::TextWrapMode::Wrap),
+                        );
                     }
                 });
 
