@@ -17,7 +17,7 @@ match_contains = "GPUID"
 weight = 40
 verdict = "NVIDIA GPU driver timeout (TDR) - the game did not crash on its own"
 confidence = "High"
-next_steps = ["Зніміть OC/undervolt GPU та пам'яті", "Перевірте версію драйвера", "Спробуйте вимкнути MPO"]
+next_steps = ["Remove GPU and memory overclock/undervolt", "Check the driver version", "Try disabling MPO"]
 link = "https://learn.microsoft.com/en-us/answers/questions/4307117/game-crash-with-the-description-for-event-id-0-fro"
 
 [[rules]]
@@ -29,7 +29,7 @@ event_id = 153
 weight = 40
 verdict = "AMD GPU driver timeout (TDR) - the game did not crash on its own"
 confidence = "High"
-next_steps = ["Вимкніть OC/undervolt", "Спробуйте WhisperMode/профіль стабільності Adrenalin", "Перевірте MPO"]
+next_steps = ["Disable overclock/undervolt", "Try WhisperMode or the Adrenalin stability profile", "Check MPO"]
 link = "https://learn.microsoft.com/en-us/answers/questions/4174161/event-id-4101-display-driver-amdwddmg-stopped-resp"
 
 [[rules]]
@@ -41,7 +41,7 @@ event_id = 153
 weight = 40
 verdict = "Intel graphics driver timeout (TDR)"
 confidence = "High"
-next_steps = ["Перевірте драйвер Intel", "Вимкніть MPO", "Перевірте живлення/температуру"]
+next_steps = ["Check the Intel driver", "Disable MPO", "Check power and temperatures"]
 link = "https://learn.microsoft.com/en-us/answers/questions/2319492/surface-laptop-3-event-4101-display-driver-igfxn-s"
 
 [[rules]]
@@ -68,7 +68,7 @@ event_id = 2004
 weight = 35
 verdict = "Low virtual memory (commit) - check pagefile, not VRAM"
 confidence = "High"
-next_steps = ["Перевірте CommitLimit vs Commit у верхній панелі", "Збільште pagefile або закрийте memory-hungry процеси"]
+next_steps = ["Compare CommitLimit vs Commit in the top bar", "Increase the pagefile or close memory-hungry processes"]
 link = "https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-application-service-memory-leaks"
 
 [[rules]]
@@ -117,7 +117,7 @@ event_id_any = [17, 18, 19]
 weight = 35
 verdict = "Hardware / PCIe error (WHEA)"
 confidence = "High"
-next_steps = ["Перевірте PCIe-живлення та OC", "Перевірте температуру й кабелі"]
+next_steps = ["Check PCIe power and overclocks", "Check temperatures and cables"]
 link = "https://learn.microsoft.com/en-us/answers/questions/3844975/whea-logger-event-id-17-a-corrected-hardware-error"
 
 # ---------------------------------------------------------------------------
