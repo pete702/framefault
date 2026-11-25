@@ -11,7 +11,7 @@ use eframe::egui::{
 
 use crate::model::{Analysis, SystemContext};
 
-const GITHUB_URL: &str = "https://github.com/framefault/framefault";
+const GITHUB_URL: &str = "https://github.com/pete702/framefault";
 
 fn app_key(title: &str) -> String {
     title
@@ -20,6 +20,15 @@ fn app_key(title: &str) -> String {
         .unwrap_or(title)
         .trim()
         .to_owned()
+}
+
+fn short_cpu(cpu: &str) -> String {
+    let clean = cpu.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() <= 48 {
+        clean
+    } else {
+        format!("{}…", clean.chars().take(48).collect::<String>())
+    }
 }
 
 pub struct App {
@@ -176,6 +185,8 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(format!("{} | {}", self.ctx.gpu, self.ctx.driver)).small());
             ui.separator();
+            ui.label(RichText::new(format!("CPU {}", short_cpu(&self.ctx.cpu))).small());
+            ui.separator();
             ui.label(RichText::new(format!(
                 "RAM {:.1}/{:.1} GiB | Commit {:.1}/{:.1} GiB | Pagefile {}",
                 self.ctx.ram_used_gib,
@@ -321,7 +332,13 @@ impl App {
 
         ui.add_space(16.0);
         if ui.button("Copy Clean Report").clicked() {
-            let md = crate::report::markdown_with_context(&self.analysis, &self.ctx);
+            // One report = System Context + the currently selected incident,
+            // never all incidents from the scan.
+            let note = match &self.analysis {
+                crate::model::Analysis::Results { note, .. } => note.as_deref(),
+                _ => None,
+            };
+            let md = crate::report::markdown_for_incident(&self.ctx, incident, note);
             ui.ctx().copy_text(md);
             self.copied = true;
         }

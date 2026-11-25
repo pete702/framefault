@@ -5,6 +5,22 @@ use crate::model::Signal;
 const IDS: &str = "EventID=153 or EventID=4101 or EventID=2004 or EventID=1000 \
                    or EventID=1001 or EventID=41 or EventID=17 or EventID=18 or EventID=19";
 
+/// Shortens detail at a word boundary, so Raw Proof and reports never end
+/// with half tokens like `F…` or `0…`.
+pub const DETAIL_LIMIT: usize = 512;
+
+pub fn excerpt(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut head: String = flat.chars().take(max).collect();
+    if let Some(boundary) = head.rfind(' ') {
+        head.truncate(boundary);
+    }
+    format!("{head}…")
+}
+
 #[cfg(windows)]
 pub fn read_recent() -> Vec<Signal> {
     use windows::core::{HSTRING, PCWSTR};
@@ -322,4 +338,16 @@ fn parse_time(value: &str) -> Option<DateTime<Local>> {
     let value = value.trim_end_matches('Z');
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
     Local.from_local_datetime(&naive).single()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excerpt_cuts_on_a_word_boundary() {
+        let text = "one two three four five six seven eight nine ten";
+        assert_eq!(excerpt(text, 20), "one two three four…");
+        assert_eq!(excerpt("short detail", 40), "short detail");
+    }
 }

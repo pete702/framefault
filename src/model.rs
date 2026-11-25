@@ -99,4 +99,5 @@ pub struct SystemContext {
     pub overlays_now: Vec<String>,
     pub log_reach: String,
     pub windows: String,
+    pub cpu: String,
 }

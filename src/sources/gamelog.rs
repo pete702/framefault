@@ -7,15 +7,19 @@ use walkdir::WalkDir;
 
 use crate::model::Signal;
 
-const MARKERS: [&str; 10] = [
+const MARKERS: &[&str] = &[
     "DXGI_ERROR_DEVICE_HUNG",
     "DXGI_ERROR_DEVICE_REMOVED",
     "0x887A0006",
     "0x887A0005",
     "GetDeviceRemovedReason",
     "Out of video memory",
+    "VK_ERROR_OUT_OF_DEVICE_MEMORY",
     "Fatal error",
     "LogD3D12RHI: Error",
+    "EasyAntiCheat",
+    "BEDaisy",
+    "BattlEye",
     "Crash!!!",
     "OutOfMemoryException",
 ];

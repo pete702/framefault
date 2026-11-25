@@ -175,3 +175,117 @@ fn redaction_and_self_test_are_silent_about_identity() {
     assert!(report.contains("FrameFault"));
     assert!(framefault::self_test().is_ok());
 }
+
+#[test]
+fn confidence_single_high_source_is_not_lowered() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut anchor = Signal::new("game_log", now);
+    anchor.detail = "Loading level MyMap".to_owned();
+
+    let mut bugcheck = Signal::new("eventlog", now);
+    bugcheck.provider = "Microsoft-Windows-WER-SystemErrorReporting".to_owned();
+    bugcheck.event_id = Some(1001);
+    bugcheck
+        .fields
+        .insert("channel".to_owned(), "System".to_owned());
+
+    let analysis = framefault::correlate::run(&[anchor, bugcheck], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let finding = incidents[0]
+        .findings
+        .iter()
+        .find(|f| f.verdict.contains("BugCheck 1001"))
+        .expect("bugcheck finding missing");
+    assert_eq!(finding.source_count, 1);
+    assert_eq!(finding.confidence, "High");
+}
+
+#[test]
+fn confidence_two_medium_sources_are_raised_to_high() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut wer = Signal::new("wer", now);
+    wer.provider = "WER".to_owned();
+    wer.loaded_modules = vec![r"D:\Games\MyGame\EasyAntiCheat_EOS.sys".to_owned()];
+
+    let mut log = Signal::new("game_log", now);
+    log.detail = "BEDaisy.sys crashed".to_owned();
+
+    let analysis = framefault::correlate::run(&[wer, log], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let finding = incidents[0]
+        .findings
+        .iter()
+        .find(|f| f.verdict.starts_with("Anti-cheat driver crash"))
+        .expect("anti-cheat finding missing");
+    assert_eq!(finding.source_count, 2);
+    assert_eq!(finding.confidence, "High");
+}
+
+#[test]
+fn confidence_single_medium_source_stays_medium() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut log = Signal::new("game_log", now);
+    log.detail = "BEDaisy.sys crashed".to_owned();
+
+    let analysis = framefault::correlate::run(&[log], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let finding = incidents[0]
+        .findings
+        .iter()
+        .find(|f| f.verdict.starts_with("Anti-cheat driver crash"))
+        .expect("anti-cheat finding missing");
+    assert_eq!(finding.source_count, 1);
+    assert_eq!(finding.confidence, "Medium");
+}
+
+#[test]
+fn kernel_power_41_verdict_depends_on_bugcheck_code() {
+    let ruleset = framefault::rules::load();
+    let rule = ruleset
+        .rules
+        .iter()
+        .find(|r| r.id == "kernel_power_41")
+        .expect("kernel_power_41 rule missing");
+    let now = Local::now();
+
+    let mut with_code = Signal::new("eventlog", now);
+    with_code.provider = "Microsoft-Windows-Kernel-Power".to_owned();
+    with_code.event_id = Some(41);
+    with_code
+        .fields
+        .insert("channel".to_owned(), "System".to_owned());
+    with_code.detail = "BugcheckCode 159".to_owned();
+    assert!(rule.matches(&with_code));
+    let verdict = rule.verdict_for(&with_code);
+    assert!(verdict.contains("0x0000009F"), "verdict: {verdict}");
+
+    let mut zero = with_code.clone();
+    zero.detail = "BugcheckCode 0".to_owned();
+    assert!(rule.matches(&zero));
+    let verdict = rule.verdict_for(&zero);
+    assert!(
+        verdict.starts_with("Sudden power loss"),
+        "verdict: {verdict}"
+    );
+
+    let mut absent = with_code.clone();
+    absent.detail = "The system has rebooted without cleanly shutting down first.".to_owned();
+    let verdict = rule.verdict_for(&absent);
+    assert!(
+        verdict.starts_with("Sudden power loss"),
+        "verdict: {verdict}"
+    );
+}
+

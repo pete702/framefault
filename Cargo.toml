@@ -1,6 +1,6 @@
 [package]
 name = "framefault"
-version = "0.1.4"
+version = "0.1.6"
 edition = "2021"
 description = "One crash verdict per incident — read-only, no-admin Windows game crash diagnostics"
 license = "MIT"

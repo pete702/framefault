@@ -119,10 +119,21 @@ impl Rule {
         if self.id == "application_error_1000" {
             return headline(signal).unwrap_or_else(|| self.verdict.clone());
         }
-        if self.id == "bugcheck_1001" || self.id == "kernel_power_41" {
+        // Kernel-Power 41 is a BSOD only when Windows recorded a non-zero
+        // bugcheck code. Code 0 (or no code) is a plain sudden power loss
+        // and must keep the rule's own verdict.
+        if self.id == "kernel_power_41" {
+            return match bugcheck_code(signal) {
+                Some(code) if code != 0 => {
+                    bugcheck_headline(signal).unwrap_or_else(|| self.verdict.clone())
+                }
+                _ => self.verdict.clone(),
+            };
+        }
+        if self.id == "bugcheck_1001" {
             return bugcheck_headline(signal).unwrap_or_else(|| self.verdict.clone());
         }
-        if self.source == "registry" && self.match_value.as_deref() == Some("5") {
+        if self.id == "mpo_state" {
             let disabled = signal.get("value") == Some("5");
             let chosen = if disabled {
                 &self.verdict_if_disabled

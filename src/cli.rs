@@ -1,3 +1,4 @@
+use chrono::{Duration, Local};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -33,12 +34,15 @@ pub fn maybe_run() -> bool {
     }
 
     let Some(path) = args.path else { return false };
-    let analysis = crate::analyze(&path);
+    let mut analysis = crate::analyze(&path);
+    let cutoff = Local::now() - Duration::days(args.days);
+    if let crate::model::Analysis::Results { incidents, .. } = &mut analysis {
+        incidents.retain(|incident| incident.time >= cutoff);
+    }
     if args.markdown {
         println!("{}", crate::report::markdown(&analysis));
     } else {
         println!("{analysis:#?}");
     }
-    let _ = args.days;
     true
 }

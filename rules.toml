@@ -36,7 +36,7 @@ link = "https://learn.microsoft.com/en-us/answers/questions/4174161/event-id-410
 id = "tdr_intel_153"
 source = "eventlog"
 channel = "System"
-provider_any = ["igfxn", "igdkmdn64", "igdlh64"]
+provider_any = ["igfxn", "igdkmdn64", "igdkmd64", "igfx", "igdlh64"]
 event_id = 153
 weight = 40
 verdict = "Intel graphics driver timeout (TDR)"
@@ -54,6 +54,18 @@ weight = 15
 verdict = "Display driver stopped responding and recovered (TDR)"
 confidence = "High"
 link = "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/cc756372(v=ws.10)"
+
+[[rules]]
+id = "display_4101_intel"
+source = "eventlog"
+channel = "System"
+provider_any = ["igdkmdn64", "igdkmd64", "igfx"]
+event_id = 4101
+weight = 15
+verdict = "Intel Arc / Intel graphics driver stopped responding and recovered (TDR)"
+confidence = "High"
+next_steps = ["Update the Intel graphics driver", "Disable MPO", "Check GPU power and temperatures"]
+link = "https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/display-driver-stops-responding"
 
 # ---------------------------------------------------------------------------
 # Memory / commit / pagefile
@@ -78,8 +90,9 @@ channel = "System"
 provider = "Microsoft-Windows-Kernel-Power"
 event_id = 41
 weight = 10
-verdict = "Unclean restart / bugcheck recorded (Kernel-Power 41)"
+verdict = "Sudden power loss or hard shutdown before Windows could record a clean crash (Kernel-Power 41)"
 confidence = "Medium"
+next_steps = ["Check temperatures and PSU under load", "Look for WHEA 17/18/19 and BugCheck 1001 nearby", "Disable automatic restart on BSOD to capture the stop code"]
 link = "https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart"
 
 [[rules]]
@@ -102,7 +115,41 @@ event_id = 1000
 weight = 10
 verdict = "Application crash recorded (Event 1000)"
 confidence = "Info"
-link = "https://learn.microsoft.com/en-us/troubleshoot/developer/webapps/iis/site-behavior-performance/process-termination-crash"
+link = "https://learn.microsoft.com/en-us/windows/win32/wer/windows-error-reporting"
+
+# ---------------------------------------------------------------------------
+# Anti-cheat drivers - a fault here is not a bug in the game itself.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "anticheat_wer_loaded_module"
+source = "wer"
+match_field = "LoadedModule"
+match_any = ["EasyAntiCheat_EOS.sys", "EasyAntiCheat.sys", "BEDaisy.sys", "BattlEye"]
+weight = 25
+verdict = "Anti-cheat driver crash (EasyAntiCheat / BattlEye) - not a game bug"
+confidence = "Medium"
+next_steps = ["Update or reinstall the game's anti-cheat component", "Remove conflicting overlays and hardware-monitoring hooks", "Verify game files and check the anti-cheat service status"]
+
+[[rules]]
+id = "anticheat_wer_faulting_module"
+source = "wer"
+match_field = "FaultingModuleName"
+match_any = ["EasyAntiCheat_EOS.sys", "EasyAntiCheat.sys", "BEDaisy.sys", "BattlEye"]
+weight = 25
+verdict = "Anti-cheat driver crash (EasyAntiCheat / BattlEye) - not a game bug"
+confidence = "Medium"
+next_steps = ["Update or reinstall the game's anti-cheat component", "Remove conflicting overlays and hardware-monitoring hooks", "Verify game files and check the anti-cheat service status"]
+
+[[rules]]
+id = "anticheat_game_log"
+source = "game_log"
+match_field = "detail"
+match_any = ["EasyAntiCheat_EOS.sys", "EasyAntiCheat.sys", "BEDaisy.sys", "BattlEye"]
+weight = 25
+verdict = "Anti-cheat driver crash (EasyAntiCheat / BattlEye) - not a game bug"
+confidence = "Medium"
+next_steps = ["Update or reinstall the game's anti-cheat component", "Remove conflicting overlays and hardware-monitoring hooks", "Verify game files and check the anti-cheat service status"]
 
 # ---------------------------------------------------------------------------
 # Hardware
@@ -115,9 +162,9 @@ channel = "System"
 provider = "Microsoft-Windows-WHEA-Logger"
 event_id_any = [17, 18, 19]
 weight = 35
-verdict = "Hardware / PCIe error (WHEA)"
+verdict = "Hardware / PCIe / CPU cache error (WHEA) — check overclock, undervolt, or RAM stability, not the game"
 confidence = "High"
-next_steps = ["Check PCIe power and overclocks", "Check temperatures and cables"]
+next_steps = ["Check overclock and undervolt", "Run a memory stability test", "Check PCIe power and cables"]
 link = "https://learn.microsoft.com/en-us/answers/questions/3844975/whea-logger-event-id-17-a-corrected-hardware-error"
 
 # ---------------------------------------------------------------------------
@@ -173,6 +220,28 @@ verdict = "Game lost the D3D device after a driver reset"
 confidence = "High"
 
 [[rules]]
+id = "d3d12_vulkan_out_of_vram_game_log"
+source = "game_log"
+match_field = "detail"
+match_any = ["Out of video memory", "VK_ERROR_OUT_OF_DEVICE_MEMORY", "DXGI_ERROR_DEVICE_REMOVED"]
+weight = 30
+verdict = "Out of video memory (D3D12/Vulkan) - check VRAM budget, texture streaming and pagefile"
+confidence = "High"
+next_steps = ["Lower texture quality and disable ray tracing", "Close GPU-heavy overlays", "Check RAM and pagefile headroom"]
+link = "https://learn.microsoft.com/en-us/windows/win32/direct3d12/out-of-memory-handling"
+
+[[rules]]
+id = "d3d12_vulkan_out_of_vram_ue_xml"
+source = "ue_xml"
+match_field = "ErrorMessage"
+match_any = ["VK_ERROR_OUT_OF_DEVICE_MEMORY", "DXGI_ERROR_DEVICE_REMOVED"]
+weight = 30
+verdict = "Out of video memory (D3D12/Vulkan) - check VRAM budget, texture streaming and pagefile"
+confidence = "High"
+next_steps = ["Lower texture quality and disable ray tracing", "Close GPU-heavy overlays", "Check RAM and pagefile headroom"]
+link = "https://learn.microsoft.com/en-us/windows/win32/direct3d12/out-of-memory-handling"
+
+[[rules]]
 id = "live_kernel_141"
 source = "wer"
 match_field = "detail"
@@ -195,14 +264,3 @@ verdict = "Third-party overlay/proxy DLL loaded into the game at crash time"
 confidence = "Medium"
 note = "Historical evidence from Report.wer. System32/SysWOW64 DXGI/D3D DLLs are ignored."
 
-[[rules]]
-id = "mpo_state"
-source = "registry"
-match_field = "value"
-match_value = "5"
-weight = 5
-verdict = "MPO status read from HKLM"
-verdict_if_enabled = "MPO likely enabled (OverlayTestMode absent or != 5)"
-verdict_if_disabled = "MPO disabled (OverlayTestMode = 5)"
-confidence = "Info"
-link = "https://learn.microsoft.com/en-us/windows/win32/dwm/dwm-overview"

@@ -19,6 +19,10 @@ pub fn context_line(label: &str, value: &str) -> String {
     format!("- {label}: {}", redact(value))
 }
 
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
 fn mask_env_secret(input: &str, var: &str, replacement: &str) -> String {
     let Ok(value) = std::env::var(var) else {
         return input.to_string();
@@ -26,7 +30,28 @@ fn mask_env_secret(input: &str, var: &str, replacement: &str) -> String {
     if value.len() < 3 {
         return input.to_string();
     }
-    input.replace(&value, replacement)
+    // Replace the identity only as a standalone token. A blunt substring
+    // replace corrupts unrelated handles and URLs (e.g. `pete7` inside
+    // `pete702` in a GitHub link).
+    let chars: Vec<char> = input.chars().collect();
+    let needle: Vec<char> = value.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i..].starts_with(&needle) {
+            let before_ok = i == 0 || !is_token_char(chars[i - 1]);
+            let after = i + needle.len();
+            let after_ok = after == chars.len() || !is_token_char(chars[after]);
+            if before_ok && after_ok {
+                out.push_str(replacement);
+                i = after;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 fn mask_profile_paths(input: &str) -> String {
@@ -53,6 +78,12 @@ fn mask_unc_servers(input: &str) -> String {
         let mut cursor = 0usize;
         while let Some(relative) = out[cursor..].find(marker) {
             let start = cursor + relative;
+            // `http://` / `https://` are URLs, never UNC paths. A `//` with
+            // a colon right before it belongs to a scheme, not a share.
+            if start > 0 && out.as_bytes()[start - 1] == b':' {
+                cursor = start + marker.len();
+                continue;
+            }
             let body_start = start + marker.len();
             let Some(server_end) = out[body_start..].find(['\\', '/']) else {
                 break;
@@ -259,5 +290,21 @@ mod tests {
 
         let out = redact("client ip 192.168.1.20");
         assert!(out.contains("[REDACTED-IP]"), "real IPs must still be masked: {out}");
+    }
+
+    #[test]
+    fn urls_are_not_unc_paths() {
+        for url in [
+            "https://github.com/pete702/framefault",
+            "http://example.com/path/to/file",
+        ] {
+            let out = redact(url);
+            assert_eq!(out, url, "URL must stay intact: {out}");
+            assert!(!out.contains("%UNC%"), "URL must not be masked: {out}");
+        }
+
+        let out = redact(r"\\NAS\share\user");
+        assert!(out.contains(r"\\%UNC%"), "UNC share must be masked: {out}");
+        assert!(!out.contains("NAS"), "UNC server must be destroyed: {out}");
     }
 }

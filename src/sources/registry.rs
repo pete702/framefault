@@ -6,6 +6,30 @@ const GPU_CLASS: &str = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-
 const MEMORY_MGMT: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
 const DWM: &str = r"SOFTWARE\Microsoft\Windows\Dwm";
 const NT_CURRENT: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+const CPU_PATH: &str = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0";
+
+/// Some Windows 11 installations still report "Windows 10" in ProductName.
+/// The build number is the reliable discriminator.
+pub fn product_name(product: &str, build: &str) -> String {
+    let build_number = build.trim().parse::<u32>().unwrap_or(0);
+    if build_number < 22000 {
+        return product.to_owned();
+    }
+    let lower = product.to_ascii_lowercase();
+    if let Some(pos) = lower.find("windows 10") {
+        let mut out = String::with_capacity(product.len());
+        out.push_str(&product[..pos]);
+        out.push_str("Windows 11");
+        out.push_str(&product[pos + "windows 10".len()..]);
+        return out;
+    }
+    product.to_owned()
+}
+
+/// Registry CPU names contain repeated spaces from the OEM string.
+pub fn normalize_cpu(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 #[cfg(windows)]
 #[allow(clippy::field_reassign_with_default)]
@@ -53,7 +77,16 @@ pub fn read_context() -> SystemContext {
         .unwrap_or_else(|| "Windows".to_owned());
     let build = read_string_win(HKEY_LOCAL_MACHINE, NT_CURRENT, "CurrentBuild")
         .unwrap_or_default();
-    ctx.windows = format!("{product} (build {build})");
+    ctx.windows = format!("{} (build {})", product_name(&product, &build), build);
+
+    let cpu = read_string_win(HKEY_LOCAL_MACHINE, CPU_PATH, "ProcessorNameString")
+        .map(|value| normalize_cpu(&value))
+        .unwrap_or_default();
+    ctx.cpu = if cpu.is_empty() {
+        "unknown".to_owned()
+    } else {
+        cpu
+    };
 
     // GlobalMemoryStatusEx -> RAM + commit. ullTotalPageFile is the commit limit.
     unsafe {
@@ -85,15 +118,18 @@ pub fn read_context_signals() -> Vec<Signal> {
     #[cfg(windows)]
     {
         use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-        if let Some(value) = read_dword_win(HKEY_LOCAL_MACHINE, DWM, "OverlayTestMode") {
-            let mut signal = Signal::new("registry", Local::now());
-            signal.provider = "HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm".to_owned();
-            signal
-                .fields
-                .insert("value".to_owned(), value.to_string());
-            signal.detail = format!("OverlayTestMode={value}");
-            out.push(signal);
-        }
+        // Always emit an MPO context signal. A missing value means the
+        // default (enabled), which must still be representable in verdicts.
+        let mpo_value = read_dword_win(HKEY_LOCAL_MACHINE, DWM, "OverlayTestMode")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent".to_owned());
+        let mut signal = Signal::new("registry", Local::now());
+        signal.provider = "HKLM\\SOFTWARE\\Microsoft\\Windows\\Dwm".to_owned();
+        signal
+            .fields
+            .insert("value".to_owned(), mpo_value.clone());
+        signal.detail = format!("OverlayTestMode={mpo_value}");
+        out.push(signal);
         if let Some(value) = read_dword_win(
             HKEY_LOCAL_MACHINE,
             r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers",
@@ -317,4 +353,25 @@ fn live_overlays() -> Vec<String> {
         let _ = windows::Win32::Foundation::CloseHandle(snapshot);
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_11_is_detected_from_build_number() {
+        assert_eq!(product_name("Windows 10 Pro", "22000"), "Windows 11 Pro");
+        assert_eq!(product_name("Windows 10 Pro", "26100"), "Windows 11 Pro");
+        assert_eq!(product_name("Windows 10 Pro", "19045"), "Windows 10 Pro");
+        assert_eq!(product_name("Windows 11 Home", "22631"), "Windows 11 Home");
+    }
+
+    #[test]
+    fn cpu_name_is_trimmed() {
+        assert_eq!(
+            normalize_cpu("  Intel(R)  Core(TM)  i7-13700K   "),
+            "Intel(R) Core(TM) i7-13700K"
+        );
+    }
 }

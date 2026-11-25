@@ -105,7 +105,10 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
                 signal.t.format("%Y-%m-%d %H:%M:%S"),
                 signal.source,
                 signal.provider,
-                truncate(&crate::redact::redact(&signal.detail), 180)
+                crate::sources::evt::excerpt(
+                    &crate::redact::redact(&signal.detail),
+                    crate::sources::evt::DETAIL_LIMIT,
+                )
             );
 
             let entry = grouped.entry(verdict.clone()).or_insert_with(|| Finding {
@@ -151,6 +154,14 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
     for (verdict, set) in sources {
         if let Some(finding) = grouped.get_mut(&verdict) {
             finding.source_count = set.len();
+            // Confidence is derived from corroboration, but it must never drop
+            // below the confidence already assigned by the matching rule.
+            // Two independent sources are enough to call a verdict High;
+            // a single source keeps the rule's own confidence (e.g. a lone
+            // BugCheck 1001 stays High, a lone overlay stays Medium/Info).
+            if finding.source_count >= 2 {
+                finding.confidence = "High".to_owned();
+            }
         }
     }
 
@@ -160,12 +171,3 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
     findings
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let flat = text.replace(['\n', '\r'], " ");
-    if flat.chars().count() <= max {
-        flat
-    } else {
-        let head: String = flat.chars().take(max).collect();
-        format!("{head}…")
-    }
-}
