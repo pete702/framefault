@@ -24,11 +24,11 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (all features, incl. cli)
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test
-        run: cargo test
+      - name: Test (all features, incl. cli)
+        run: cargo test --all-targets --all-features
 
       - name: Build release
         run: cargo build --release

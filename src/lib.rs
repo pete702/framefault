@@ -18,12 +18,16 @@ pub fn context() -> SystemContext {
 }
 
 pub fn analyze(root: &Path) -> Analysis {
+    analyze_with_context(root, &context())
+}
+
+/// Scan using a context that was already collected (once, off the UI thread).
+pub fn analyze_with_context(root: &Path, ctx: &SystemContext) -> Analysis {
     let ruleset = rules::load();
     let mut signals = sources::evt::read_recent();
     signals.extend(sources::wer::scan(root));
     signals.extend(sources::ue::scan(root));
     signals.extend(sources::gamelog::scan(root));
-    signals.extend(sources::registry::read_context_signals());
 
     #[cfg(feature = "evtx")]
     if root.is_file()
@@ -39,7 +43,7 @@ pub fn analyze(root: &Path) -> Analysis {
     if let Analysis::Results { note, .. } = &mut analysis {
         *note = Some(format!(
             "Event Log ring buffer: {}. If the crash is older than this, absence of events is NOT evidence of absence.",
-            sources::evt::log_reach()
+            ctx.log_reach
         ));
     }
     analysis
@@ -62,11 +66,13 @@ pub fn self_test() -> Result<(), String> {
                 evidence: vec!["C:\\Users\\alice\\192.168.0.1".to_owned()],
                 next_steps: Vec::new(),
                 link: None,
+                note: None,
             }],
         }],
         note: None,
     };
-    let report = report::markdown(&sample);
+    // No registry / Event Log reads: CI must get the same result everywhere.
+    let report = report::markdown_with_context(&sample, &model::SystemContext::default());
     if report.contains("alice") || report.contains("192.168") {
         return Err("redaction leaked".to_owned());
     }

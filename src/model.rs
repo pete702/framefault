@@ -66,6 +66,8 @@ pub struct Finding {
     pub evidence: Vec<String>,
     pub next_steps: Vec<String>,
     pub link: Option<String>,
+    /// Optional provenance/classification note from the matching rule.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +88,7 @@ pub enum Analysis {
     Empty,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SystemContext {
     pub gpu: String,
     pub driver: String,
@@ -100,4 +102,35 @@ pub struct SystemContext {
     pub log_reach: String,
     pub windows: String,
     pub cpu: String,
+    /// Hardware-accelerated GPU scheduling (HwSchMode).
+    pub hags: String,
+    /// Non-default TDR registry overrides, if any.
+    pub tdr_note: Option<String>,
+    /// Low free space on C: or the pagefile drive, if any.
+    pub disk_warn: Option<String>,
+    /// Time since the last full boot, in hours.
+    pub uptime_hours: u64,
+}
+
+impl Default for SystemContext {
+    fn default() -> Self {
+        Self {
+            gpu: String::new(),
+            driver: String::new(),
+            ram_total_gib: 0.0,
+            ram_used_gib: 0.0,
+            commit_limit_gib: 0.0,
+            commit_used_gib: 0.0,
+            pagefile: String::new(),
+            mpo: String::new(),
+            overlays_now: Vec::new(),
+            log_reach: String::new(),
+            windows: String::new(),
+            cpu: String::new(),
+            hags: "Default/Unknown".to_owned(),
+            tdr_note: None,
+            disk_warn: None,
+            uptime_hours: 0,
+        }
+    }
 }

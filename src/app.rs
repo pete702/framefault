@@ -9,9 +9,17 @@ use eframe::egui::{
     TextureHandle, Vec2,
 };
 
-use crate::model::{Analysis, SystemContext};
+use crate::model::{Analysis, Incident, SystemContext};
 
 const GITHUB_URL: &str = "https://github.com/pete702/framefault";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IncidentFilter {
+    #[default]
+    All,
+    GamesAndGpu,
+    HardwareAndBsod,
+}
 
 fn app_key(title: &str) -> String {
     title
@@ -31,20 +39,60 @@ fn short_cpu(cpu: &str) -> String {
     }
 }
 
+const HARDWARE_MARKERS: &[&str] = &[
+    "bugcheck",
+    "bsod",
+    "blue screen",
+    "whea",
+    "kernel-power",
+    "kernel power",
+    "resource-exhaustion",
+    "low virtual memory",
+    "livekernelevent",
+    "live kernel event",
+    "2004",
+];
+
+fn matches_filter(filter: IncidentFilter, query: &str, inc: &Incident) -> bool {
+    let text = App::incident_text(inc);
+    let lower = text.to_ascii_lowercase();
+    let category = match filter {
+        IncidentFilter::All => true,
+        // One marker set with the markdown header, in report.rs.
+        IncidentFilter::GamesAndGpu => crate::report::incident_has_gpu_context(inc),
+        IncidentFilter::HardwareAndBsod => {
+            HARDWARE_MARKERS.iter().any(|marker| lower.contains(marker))
+        }
+    };
+    if !category {
+        return false;
+    }
+    let query = query.trim().to_ascii_lowercase();
+    query.is_empty() || lower.contains(&query)
+}
+
 pub struct App {
     ctx: SystemContext,
     analysis: Analysis,
     selected: usize,
     days: i64,
     path: Option<PathBuf>,
+    /// Raw drop slot from egui; consumed once per frame.
     pending: Option<PathBuf>,
+    /// A dropped path waiting for the next scan. Kept separate from `path`
+    /// so a finishing scan cannot overwrite it with its own older root.
+    pending_path: Option<PathBuf>,
     last_scanned: Option<PathBuf>,
     status: String,
     logo: Option<TextureHandle>,
     copied: bool,
     scanning: bool,
-    receiver: Option<Receiver<(Analysis, PathBuf)>>,
+    /// A day/Rescan click during a scan is replayed instead of dropped.
+    rescan_queued: bool,
+    receiver: Option<Receiver<(Analysis, SystemContext, PathBuf)>>,
     hidden_apps: Vec<String>,
+    filter: IncidentFilter,
+    search_query: String,
 }
 
 fn install_system_fonts(ctx: &egui::Context) {
@@ -78,35 +126,48 @@ impl App {
             .load_texture("framefault-logo", image, egui::TextureOptions::NEAREST);
 
         let mut app = Self {
-            ctx: crate::context(),
+            // Real context arrives from the background scan; no registry/Event
+            // Log reads on the UI thread while the window opens.
+            ctx: SystemContext::default(),
             analysis: Analysis::Empty,
             selected: 0,
             days: 7,
             path: None,
             pending: None,
+            pending_path: None,
             status: "Drop a crash folder, .wer, .xml or .log to begin.".to_owned(),
             logo: Some(logo),
             copied: false,
             scanning: false,
+            rescan_queued: false,
             receiver: None,
             hidden_apps: Vec::new(),
+            filter: IncidentFilter::default(),
+            search_query: String::new(),
             last_scanned: None,
         };
         app.start_scan();
         app
     }
 
+    /// Root of the next scan: a dropped path wins over the previous root.
+    fn next_root(&mut self) -> PathBuf {
+        self.pending_path
+            .take()
+            .or_else(|| self.path.clone())
+            .or_else(dirs::data_local_dir)
+            .unwrap_or_default()
+    }
+
     /// Launch the read-only scan on a background thread so the window opens instantly.
     fn start_scan(&mut self) {
         if self.scanning {
+            self.rescan_queued = true;
             return;
         }
-        self.ctx = crate::context();
-        let root = self
-            .path
-            .clone()
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_default();
+        self.rescan_queued = false;
+        let root = self.next_root();
+        self.path = Some(root.clone());
         let (tx, rx) = channel();
         self.receiver = Some(rx);
         self.scanning = true;
@@ -114,24 +175,50 @@ impl App {
         self.copied = false;
 
         std::thread::spawn(move || {
-            let analysis = crate::analyze(&root);
-            let _ = tx.send((analysis, root));
+            let ctx = crate::context();
+            let analysis = crate::analyze_with_context(&root, &ctx);
+            let _ = tx.send((analysis, ctx, root));
         });
     }
 
-    fn finish_scan(&mut self, analysis: Analysis, root: PathBuf) {
+    fn finish_scan(&mut self, analysis: Analysis, ctx: SystemContext, root: PathBuf) {
+        let queued = self.rescan_queued;
+        self.rescan_queued = false;
         let mut analysis = analysis;
         if let Analysis::Results { incidents, .. } = &mut analysis {
             let cutoff = Local::now() - Duration::days(self.days);
             incidents.retain(|incident| incident.time >= cutoff);
         }
-        self.path = Some(root.clone());
+        // `self.path` already points at the root of the currently displayed
+        // scan; overwriting it here would destroy a path dropped mid-scan.
         self.last_scanned = Some(root);
+        self.ctx = ctx;
         self.analysis = analysis;
         self.selected = 0;
         self.scanning = false;
         let count = self.visible_incidents().len();
         self.status = format!("Scanned {count} incident(s) | {}", Local::now().format("%H:%M:%S"));
+        if queued {
+            self.start_scan();
+        }
+    }
+
+    fn incident_text(inc: &Incident) -> String {
+        let mut text = inc.title.clone();
+        text.push('\n');
+        for finding in &inc.findings {
+            text.push_str(&finding.verdict);
+            text.push('\n');
+            for line in &finding.evidence {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    fn matches_filter(&self, inc: &Incident) -> bool {
+        matches_filter(self.filter, &self.search_query, inc)
     }
 
     fn visible_incidents(&self) -> Vec<crate::model::Incident> {
@@ -139,6 +226,7 @@ impl App {
             Analysis::Results { incidents, .. } => incidents
                 .iter()
                 .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
+                .filter(|incident| self.matches_filter(incident))
                 .cloned()
                 .collect(),
             _ => Vec::new(),
@@ -197,12 +285,54 @@ impl App {
             )).small());
             ui.separator();
             ui.label(RichText::new(format!("MPO: {}", self.ctx.mpo)).small());
+            ui.separator();
+            ui.label(RichText::new(format!("HAGS: {}", self.ctx.hags)).small());
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "Uptime: {}",
+                    crate::report::uptime_label(self.ctx.uptime_hours)
+                ))
+                .small(),
+            );
+            if let Some(note) = &self.ctx.tdr_note {
+                warning_badge(ui, note, "Non-default TDR registry value (read-only).");
+            }
+            if let Some(warning) = &self.ctx.disk_warn {
+                warning_badge(
+                    ui,
+                    warning,
+                    "Low free space on C: or the pagefile drive.",
+                );
+            }
         });
     }
 
     fn incident_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("Incidents");
         ui.label(RichText::new(&self.ctx.log_reach).small().weak());
+        ui.horizontal(|ui| {
+            for (filter, label) in [
+                (IncidentFilter::All, "All"),
+                (IncidentFilter::GamesAndGpu, "Games/GPU"),
+                (IncidentFilter::HardwareAndBsod, "BSOD/HW"),
+            ] {
+                if ui.selectable_label(self.filter == filter, label).clicked() {
+                    self.filter = filter;
+                    self.selected = 0;
+                }
+            }
+        });
+        let width = ui.available_width();
+        let previous_query = self.search_query.clone();
+        ui.add(
+            egui::TextEdit::singleline(&mut self.search_query)
+                .hint_text("Filter by app or code...")
+                .desired_width(width),
+        );
+        if self.search_query != previous_query {
+            self.selected = 0;
+        }
         ui.separator();
 
         let incidents = self.visible_incidents();
@@ -264,6 +394,9 @@ impl App {
         }
 
         let incidents = self.visible_incidents();
+        if !incidents.is_empty() && self.selected >= incidents.len() {
+            self.selected = 0;
+        }
         let Some(incident) = incidents.get(self.selected) else {
             ui.label("Select an incident on the left, or show hidden apps.");
             return;
@@ -319,6 +452,10 @@ impl App {
                     }
                 });
 
+            if let Some(note) = &finding.note {
+                ui.add_space(4.0);
+                ui.label(RichText::new(note.as_str()).small().weak());
+            }
             if !finding.next_steps.is_empty() {
                 ui.label("Next steps:");
                 for step in &finding.next_steps {
@@ -372,7 +509,9 @@ impl eframe::App for App {
             }
         });
         if let Some(path) = self.pending.take() {
-            self.path = Some(path);
+            // If a scan is in flight, start_scan() only queues; the new path
+            // survives in pending_path until that scan finishes.
+            self.pending_path = Some(path);
             self.start_scan();
         }
 
@@ -380,9 +519,9 @@ impl eframe::App for App {
             .receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok());
-        if let Some((analysis, root)) = received {
+        if let Some((analysis, ctx, root)) = received {
             self.receiver = None;
-            self.finish_scan(analysis, root);
+            self.finish_scan(analysis, ctx, root);
         }
         if self.scanning {
             ui.ctx().request_repaint_after(StdDuration::from_millis(120));
@@ -417,6 +556,18 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
     );
 }
 
+fn warning_badge(ui: &mut egui::Ui, text: &str, tooltip: &str) {
+    let button = egui::Button::new(
+        RichText::new(text)
+            .small()
+            .strong()
+            .color(Color32::from_rgb(70, 45, 0)),
+    )
+    .small()
+    .fill(Color32::from_rgb(255, 184, 77));
+    ui.add(button).on_hover_text(tooltip);
+}
+
 pub fn native_options() -> eframe::NativeOptions {
     let icon = Arc::new(eframe::egui::IconData {
         rgba: include_bytes!("../assets/icon.rgba").to_vec(),
@@ -429,5 +580,106 @@ pub fn native_options() -> eframe::NativeOptions {
             .with_drag_and_drop(true)
             .with_icon(icon),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Finding;
+
+    fn bsod_incident() -> Incident {
+        let title = "BSOD 0x0000000A (IRQL_NOT_LESS_OR_EQUAL)".to_owned();
+        Incident {
+            time: Local::now(),
+            title: title.clone(),
+            findings: vec![Finding {
+                verdict: title,
+                score: 20,
+                confidence: "High".to_owned(),
+                source_count: 1,
+                evidence: vec![
+                    "2026-11-25 10:00:00 | eventlog | Microsoft-Windows-WER-SystemErrorReporting | The Bug Check was: 0x0000000A (0xffff)"
+                        .to_owned(),
+                ],
+                next_steps: Vec::new(),
+                link: None,
+                note: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn clean_wer_bsod_is_hardware_only() {
+        let incident = bsod_incident();
+        assert!(!matches_filter(IncidentFilter::GamesAndGpu, "", &incident));
+        assert!(matches_filter(
+            IncidentFilter::HardwareAndBsod,
+            "",
+            &incident
+        ));
+        assert!(matches_filter(IncidentFilter::All, "", &incident));
+    }
+
+    #[test]
+    fn gpu_marker_incident_passes_games_filter() {
+        let mut incident = bsod_incident();
+        incident.findings[0].evidence.push(
+            "2026-11-25 10:00:05 | eventlog | nvlddmkm | GPUID=10de:1b06".to_owned(),
+        );
+        assert!(matches_filter(
+            IncidentFilter::GamesAndGpu,
+            "",
+            &incident
+        ));
+    }
+
+    fn idle_app() -> App {
+        App {
+            ctx: SystemContext::default(),
+            analysis: Analysis::Empty,
+            selected: 0,
+            days: 7,
+            path: None,
+            pending: None,
+            pending_path: None,
+            last_scanned: None,
+            status: String::new(),
+            logo: None,
+            copied: false,
+            scanning: false,
+            rescan_queued: false,
+            receiver: None,
+            hidden_apps: Vec::new(),
+            filter: IncidentFilter::default(),
+            search_query: String::new(),
+        }
+    }
+
+    #[test]
+    fn drop_during_scan_survives_the_old_result() {
+        let mut app = idle_app();
+        app.path = Some(PathBuf::from("old-root"));
+        app.pending_path = Some(PathBuf::from("new-root"));
+        app.scanning = true;
+
+        app.start_scan();
+        assert!(app.rescan_queued, "the busy click must be queued");
+        assert_eq!(app.path, Some(PathBuf::from("old-root")));
+        assert_eq!(app.pending_path, Some(PathBuf::from("new-root")));
+
+        // Suppress the automatic replay so this unit test spawns no thread.
+        app.rescan_queued = false;
+        app.finish_scan(
+            Analysis::Empty,
+            SystemContext::default(),
+            PathBuf::from("old-root"),
+        );
+        assert_eq!(
+            app.path,
+            Some(PathBuf::from("old-root")),
+            "finish_scan must not overwrite a pending drop"
+        );
+        assert_eq!(app.next_root(), PathBuf::from("new-root"));
     }
 }

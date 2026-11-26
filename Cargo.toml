@@ -1,6 +1,6 @@
 [package]
 name = "framefault"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "One crash verdict per incident — read-only, no-admin Windows game crash diagnostics"
 license = "MIT"
@@ -13,6 +13,7 @@ windows = { version = "0.62", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_EventLog",
   "Win32_System_SystemInformation",
+  "Win32_Storage_FileSystem",
   "Win32_Graphics_Dxgi",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -22,12 +23,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 walkdir = "2"
 dirs = "7"
 clap = { version = "4", optional = true, features = ["derive"] }
-evtx = { version = "0.15", optional = true, default-features = false }
 
 [features]
 default = []
 cli = ["dep:clap"]
-evtx = ["dep:evtx"]
+# .evtx fallback is implemented by shelling out to wevtutil; no crate needed.
+evtx = []
 
 [profile.release]
 opt-level = "z"

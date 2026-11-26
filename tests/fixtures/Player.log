@@ -1,3 +1,4 @@
 Player.log: Loading level Arena
 Crash!!! Native stacktrace follows
 OutOfMemoryException: Unable to allocate rendering resource
+DXGI_ERROR_DEVICE_HUNG: device removed after driver timeout

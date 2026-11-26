@@ -34,13 +34,14 @@ pub fn maybe_run() -> bool {
     }
 
     let Some(path) = args.path else { return false };
-    let mut analysis = crate::analyze(&path);
+    let ctx = crate::context();
+    let mut analysis = crate::analyze_with_context(&path, &ctx);
     let cutoff = Local::now() - Duration::days(args.days);
     if let crate::model::Analysis::Results { incidents, .. } = &mut analysis {
         incidents.retain(|incident| incident.time >= cutoff);
     }
     if args.markdown {
-        println!("{}", crate::report::markdown(&analysis));
+        println!("{}", crate::report::markdown_with_context(&analysis, &ctx));
     } else {
         println!("{analysis:#?}");
     }

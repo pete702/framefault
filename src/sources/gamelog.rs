@@ -32,37 +32,85 @@ fn source_for(name: &str) -> &'static str {
     }
 }
 
+/// UE/UE5 writes its logs to `<game>\Saved\Logs\`. Nothing else under
+/// %LOCALAPPDATA% is a game log, so browsers and editor caches stay untouched.
+fn in_saved_logs(path: &Path) -> bool {
+    path.components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case("Saved") && pair[1].eq_ignore_ascii_case("Logs"))
+}
+
+fn is_log_file(path: &Path) -> bool {
+    path.extension()
+        .map(|e| e.eq_ignore_ascii_case("log"))
+        .unwrap_or(false)
+}
+
 pub fn scan(root: &Path) -> Vec<Signal> {
-    let files: Vec<PathBuf> = if root.is_file() {
-        let is_log = root
-            .extension()
-            .map(|e| e.eq_ignore_ascii_case("log"))
-            .unwrap_or(false);
-        if is_log {
-            vec![root.to_path_buf()]
+    if root.is_file() {
+        return if is_log_file(root) {
+            parse(root).into_iter().collect()
         } else {
             Vec::new()
-        }
-    } else {
-        let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
-        for entry in WalkDir::new(root).max_depth(7).into_iter().flatten() {
-            let is_log = entry
-                .path()
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("log"))
-                .unwrap_or(false);
-            if !is_log {
+        };
+    }
+
+    let is_default_local = dirs::data_local_dir().is_some_and(|d| d.as_path() == root);
+    let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
+
+    if is_default_local {
+        // a) Unreal logs inside *\Saved\Logs\ only, never Chrome/Discord/VS Code.
+        for entry in WalkDir::new(root).max_depth(5).into_iter().flatten() {
+            if !entry.file_type().is_file()
+                || !is_log_file(entry.path())
+                || !in_saved_logs(entry.path())
+            {
                 continue;
             }
             if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
                 found.push((entry.path().to_path_buf(), modified));
             }
         }
-        found.sort_by_key(|entry| std::cmp::Reverse(entry.1));
-        found.into_iter().take(6).map(|(p, _)| p).collect()
-    };
 
-    files.iter().filter_map(|p| parse(p)).collect()
+        // b) Unity always puts Player.log in the sibling AppData\LocalLow.
+        if let Some(parent) = root.parent() {
+            let locallow = parent.join("LocalLow");
+            if locallow.is_dir() {
+                for entry in WalkDir::new(locallow).max_depth(4).into_iter().flatten() {
+                    if !entry.file_type().is_file()
+                        || !entry
+                            .file_name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case("player.log")
+                    {
+                        continue;
+                    }
+                    if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
+                        found.push((entry.path().to_path_buf(), modified));
+                    }
+                }
+            }
+        }
+    } else {
+        // Explicit folder from drag-and-drop: keep the broad search.
+        for entry in WalkDir::new(root).max_depth(7).into_iter().flatten() {
+            if !entry.file_type().is_file() || !is_log_file(entry.path()) {
+                continue;
+            }
+            if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
+                found.push((entry.path().to_path_buf(), modified));
+            }
+        }
+    }
+
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    found
+        .into_iter()
+        .take(10)
+        .filter_map(|(path, _)| parse(&path))
+        .collect()
 }
 
 fn parse(path: &Path) -> Option<Signal> {
@@ -89,6 +137,13 @@ fn parse(path: &Path) -> Option<Signal> {
         .into_owned();
     let mut signal = Signal::new(source_for(&name), time);
     signal.provider = name;
-    signal.detail = matched.into_iter().rev().take(60).collect::<Vec<_>>().join("\n");
+    // `matched` is newest-first (lines are scanned in reverse). Take the 60
+    // newest matches, then reverse for chronological detail.
+    signal.detail = matched
+        .into_iter()
+        .take(60)
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
     Some(signal)
 }

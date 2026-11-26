@@ -1,0 +1,8 @@
+Version=1
+EventType=LiveKernelEvent
+Code=141
+ReportCreateTimeStamp=2026-11-20T10:11:12
+ProblemEventName=LiveKernelEvent
+FaultingModule=nvlddmkm.sys
+LoadedModule[0]=C:\Windows\System32\ntdll.dll
+LoadedModule[1]=D:\Games\Game\RTSSHooks64.dll

@@ -24,7 +24,7 @@ No installation. No admin/UAC. No drivers. No telemetry.
 
 Windows already records why a game crashed — across Event Viewer, WER folders and engine logs. Reading it means knowing which provider, event ID and timestamp matters. FrameFault does that correlation for you and gives you one answer instead of a wall of noise.
 
-- **One verdict, not a data dump.** The newest crash is the anchor; related signals within ±15 seconds are grouped into one incident.
+- **One verdict, not a data dump.** The newest crash is the anchor; related signals within ±15 seconds of any anchor are grouped into one incident (up to ~60 seconds across a chain of anchors).
 - **Evidence you can check.** Every verdict has a timestamped `Raw Proof` chain and an official Microsoft/vendor link.
 - **Next steps that make sense.** Remove the overclock, update the driver, disable MPO — not "reinstall Windows".
 - **Safe to share.** Usernames, computer names, SIDs, local IPs, GUIDs and serial-like tokens are irreversibly redacted before the report reaches your clipboard.
@@ -90,7 +90,7 @@ FrameFault is 100% read-only and never guesses. If the Event Log ring buffer no 
 ## How correlation works
 
 1. **Collect** read-only signals from Event Log, WER, Unreal XML, Unity/game logs and Windows hardware context.
-2. **Anchor** on the newest crash event, then group all signals within ±15 seconds.
+2. **Anchor** on the newest crash event, then group all signals within ±15 seconds of any anchor in the chain (up to ~60 seconds for a chain of anchors).
 3. **Correlate** by time, process and module; deduplicate and rank independent sources.
 4. **Explain** each cause with a timestamped evidence chain, confidence, official links and next steps.
 5. **Redact** irreversibly before any report leaves the app.
@@ -104,12 +104,14 @@ FrameFault is 100% read-only and never guesses. If the Event Log ring buffer no 
 ## Build from source
 
 ```powershell
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
-Run these from the repository root. Release profile: `opt-level="z"`, `lto="fat"`, `strip="symbols"`, `panic="abort"`, single codegen unit, `windows_subsystem="windows"`, eframe with `glow` only.
+Run these from the repository root. The release profile in `Cargo.toml` sets `opt-level="z"`, `lto="fat"`, `strip="symbols"`, `panic="abort"` and a single codegen unit; eframe uses `glow` only. `windows_subsystem="windows"` is declared in `src/main.rs` via `cfg_attr(all(windows, not(feature = "cli")), ...)`, so the CLI feature keeps a console.
+
+Optional Cargo features: `cli` enables the headless mode (`--self-test`, `--markdown`, `--days`), and `evtx` enables the fallback reader for exported `.evtx` files through `wevtutil` (no extra crate). CI checks both features with the `--all-features` commands above.
 
 Rules and official references live in `rules.toml` (embedded into the binary at compile time — no extra file needed to run).
 

@@ -1,6 +1,5 @@
 version = 1
 window_sec = 15
-anchors = ["wer", "ue_xml", "unity_log", "game_log", "application_error_1000"]
 
 # ---------------------------------------------------------------------------
 # GPU driver resets (TDR). NVIDIA / AMD / Intel all land in different providers.
@@ -213,6 +212,7 @@ confidence = "High"
 [[rules]]
 id = "dxgi_device_hung"
 source = "game_log"
+source_any = ["unity_log"]
 match_field = "detail"
 match_any = ["DXGI_ERROR_DEVICE_HUNG", "0x887A0006", "DXGI_ERROR_DEVICE_REMOVED", "0x887A0005"]
 weight = 20
@@ -222,6 +222,7 @@ confidence = "High"
 [[rules]]
 id = "d3d12_vulkan_out_of_vram_game_log"
 source = "game_log"
+source_any = ["unity_log"]
 match_field = "detail"
 match_any = ["Out of video memory", "VK_ERROR_OUT_OF_DEVICE_MEMORY", "DXGI_ERROR_DEVICE_REMOVED"]
 weight = 30
@@ -244,8 +245,9 @@ link = "https://learn.microsoft.com/en-us/windows/win32/direct3d12/out-of-memory
 [[rules]]
 id = "live_kernel_141"
 source = "wer"
-match_field = "detail"
-match_contains = "141"
+match_field = "LiveKernelCode"
+require_field = true
+match_value = "141"
 weight = 25
 verdict = "LiveKernelEvent 141 - VIDEO_TDR without a full reboot"
 confidence = "High"

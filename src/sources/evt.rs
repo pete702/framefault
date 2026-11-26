@@ -9,6 +9,10 @@ const IDS: &str = "EventID=153 or EventID=4101 or EventID=2004 or EventID=1000 \
 /// with half tokens like `F…` or `0…`.
 pub const DETAIL_LIMIT: usize = 512;
 
+/// Cap per Event Log channel. A noisy service in Application must not push
+/// the System events (TDR, WHEA, BugCheck) out of the scan.
+const EVENT_LIMIT: usize = 300;
+
 pub fn excerpt(text: &str, max: usize) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -33,6 +37,7 @@ pub fn read_recent() -> Vec<Signal> {
     let mut out = Vec::new();
     for channel in ["System", "Application"] {
         let channel_name = HSTRING::from(channel);
+        let mut per_channel = Vec::new();
         unsafe {
             let handle = match EvtQuery(
                 None,
@@ -46,25 +51,35 @@ pub fn read_recent() -> Vec<Signal> {
 
             let mut batch = [0isize; 64];
             let mut returned = 0u32;
-            loop {
+            'events: loop {
                 if EvtNext(handle, &mut batch, 0, 0, &mut returned).is_err() {
-                    break;
+                    break 'events;
                 }
                 if returned == 0 {
-                    break;
+                    break 'events;
                 }
-                for event in batch.iter().take(returned as usize) {
+                for (index, event) in batch.iter().take(returned as usize).enumerate() {
                     if let Some(xml) = render_xml(EVT_HANDLE(*event)) {
-                        out.extend(parse_xml(&xml, channel));
+                        per_channel.extend(parse_xml(&xml, channel));
                     }
                     let _ = EvtClose(EVT_HANDLE(*event));
-                }
-                if out.len() >= 300 {
-                    break;
+                    if per_channel.len() >= EVENT_LIMIT {
+                        // EvtNext returned a whole batch: close the handles we
+                        // never got to before leaving the loop.
+                        for pending in batch
+                            .iter()
+                            .skip(index + 1)
+                            .take(returned as usize - index - 1)
+                        {
+                            let _ = EvtClose(EVT_HANDLE(*pending));
+                        }
+                        break 'events;
+                    }
                 }
             }
             let _ = EvtClose(handle);
         }
+        out.extend(per_channel.into_iter().take(EVENT_LIMIT));
     }
     out
 }
@@ -172,7 +187,8 @@ unsafe fn render_xml(event: windows::Win32::System::EventLog::EVT_HANDLE) -> Opt
 #[cfg(feature = "evtx")]
 pub fn scan_evtx(path: &std::path::Path) -> Vec<Signal> {
     // Optional fallback: exported .evtx files are read through wevtutil /lf:true.
-    let xpath = format!("/q:*[System[{}]]", IDS);
+    let xpath = format!("*[System[{}]]", IDS);
+    let query = format!("/q:{xpath}");
     let mut command = std::process::Command::new("wevtutil");
     command.args([
         "qe",
@@ -181,7 +197,7 @@ pub fn scan_evtx(path: &std::path::Path) -> Vec<Signal> {
         "/c:300",
         "/rd:true",
         "/f:text",
-        xpath.as_str(),
+        query.as_str(),
     ]);
     #[cfg(windows)]
     {
@@ -194,9 +210,29 @@ pub fn scan_evtx(path: &std::path::Path) -> Vec<Signal> {
     }
 }
 
+/// Index of the tag-closing '>', ignoring '>' inside quoted attribute values.
+fn find_tag_end(text: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (index, ch) in text.char_indices() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => quote = Some(ch),
+            None if ch == '>' => return Some(index),
+            None => {}
+        }
+    }
+    None
+}
+
 fn attribute(xml: &str, start: &str, key: &str) -> Option<String> {
     let from = xml.find(start)? + start.len();
-    let segment = &xml[from..];
+    let rest = &xml[from..];
+    // Never read past this tag's '>': an unnamed <Data> must not borrow the
+    // Name= attribute of the following tag. A raw '>' inside quotes is legal
+    // XML and must not end the tag early.
+    let tag_end = find_tag_end(rest)?;
+    let segment = &rest[..tag_end];
     let value_start = segment.find(key)? + key.len();
     let rest = &segment[value_start..];
     let quote = rest.chars().next()?;
@@ -241,9 +277,12 @@ fn parse_xml(text: &str, channel: &str) -> Vec<Signal> {
         let mut detail = String::new();
         for (data_index, (offset, _)) in chunk.match_indices("<Data").enumerate() {
             let rest = &chunk[offset..];
-            let Some(gt) = rest.find('>') else { continue };
+            let Some(gt) = find_tag_end(rest) else { continue };
             let Some(close) = rest[gt + 1..].find("</Data>") else { continue };
             let value = rest[gt + 1..gt + 1 + close].trim().to_owned();
+            if value.is_empty() {
+                continue;
+            }
             let name = attribute(rest, "<Data", "Name=");
             match name {
                 Some(name) => {
@@ -349,5 +388,92 @@ mod tests {
         let text = "one two three four five six seven eight nine ten";
         assert_eq!(excerpt(text, 20), "one two three four…");
         assert_eq!(excerpt("short detail", 40), "short detail");
+    }
+
+    #[test]
+    fn unnamed_data_does_not_borrow_the_next_data_name() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="Application Error" />
+<EventID>1000</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData>
+<Data>Unexpected</Data>
+<Data Name="ExceptionCode">e06d7363</Data>
+</EventData>
+</Event>"#;
+        let signals = parse_xml(xml, "Application");
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert!(
+            signal.detail.contains("Data[0]=Unexpected"),
+            "detail: {}",
+            signal.detail
+        );
+        assert!(
+            !signal.detail.contains("ExceptionCode=Unexpected"),
+            "Name leaked backwards: {}",
+            signal.detail
+        );
+        assert_eq!(signal.get("ExceptionCode"), Some("e06d7363"));
+    }
+
+    #[test]
+    fn greater_than_inside_quoted_attributes_is_not_a_tag_end() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="Game > Test" />
+<EventID>1000</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData>
+<Data Name="Side > Info">value</Data>
+</EventData>
+</Event>"#;
+        let signals = parse_xml(xml, "Application");
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal.provider, "Game > Test", "provider: {}", signal.provider);
+        assert_eq!(signal.get("Side > Info"), Some("value"));
+        assert!(
+            signal.detail.contains("Side > Info=value"),
+            "detail: {}",
+            signal.detail
+        );
+    }
+
+    #[test]
+    fn empty_xml_data_fields_are_not_written_to_detail() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="Application Error" />
+<EventID>1000</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData>
+<Data Name="PackageFullName"></Data>
+<Data Name="PackageRelativeAppId">   </Data>
+<Data Name="FaultingApplicationName">Game.exe</Data>
+<Data Name="ExceptionCode">e06d7363</Data>
+</EventData>
+</Event>"#;
+
+        let signals = parse_xml(xml, "Application");
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert!(
+            !signal.detail.contains("PackageFullName="),
+            "detail: {}",
+            signal.detail
+        );
+        assert!(
+            !signal.detail.contains("PackageRelativeAppId="),
+            "detail: {}",
+            signal.detail
+        );
+        assert!(!signal.fields.contains_key("PackageFullName"));
+        assert!(signal.detail.contains("FaultingApplicationName=Game.exe"));
+        assert_eq!(signal.get("ExceptionCode"), Some("e06d7363"));
     }
 }

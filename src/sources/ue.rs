@@ -86,15 +86,41 @@ fn parse(path: &Path) -> Option<Signal> {
         }
     }
 
-    let mut detail = String::new();
-    for (key, value) in &map {
-        detail.push_str(key);
-        detail.push('=');
-        detail.push_str(value);
-        detail.push('\n');
-    }
-    signal.detail = detail;
+    signal.detail = detail_from_map(&map);
     Some(signal)
+}
+
+/// HashMap iteration order changes between runs; build detail in a fixed
+/// order so evidence lines are byte-for-byte reproducible.
+fn detail_from_map(map: &HashMap<String, String>) -> String {
+    let mut keys: Vec<String> = FIELDS.iter().map(|key| key.to_ascii_lowercase()).collect();
+    for extra in ["time", "crashtime", "timestamp", "callstack"] {
+        keys.push(extra.to_owned());
+    }
+
+    let mut out = String::new();
+    for key in &keys {
+        if let Some(value) = map.get(key) {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        }
+    }
+
+    // Unknown tags are still kept, but sorted rather than hash-ordered.
+    let mut rest: Vec<(&String, &String)> = map
+        .iter()
+        .filter(|(key, _)| !keys.contains(key))
+        .collect();
+    rest.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in rest {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    out
 }
 
 fn read_tags(text: &str) -> HashMap<String, String> {
@@ -122,4 +148,24 @@ fn read_tags(text: &str) -> HashMap<String, String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_lines_follow_a_fixed_key_order() {
+        let mut map = HashMap::new();
+        map.insert("errormessage".to_owned(), "boom".to_owned());
+        map.insert("gamename".to_owned(), "Game".to_owned());
+        map.insert("bisoom".to_owned(), "true".to_owned());
+        map.insert("zzz_extra".to_owned(), "last".to_owned());
+        map.insert("aaa_extra".to_owned(), "first".to_owned());
+
+        assert_eq!(
+            detail_from_map(&map),
+            "gamename=Game\nbisoom=true\nerrormessage=boom\naaa_extra=first\nzzz_extra=last\n"
+        );
+    }
 }

@@ -4,8 +4,6 @@ use serde::Deserialize;
 pub struct RuleSet {
     pub version: u8,
     pub window_sec: i64,
-    #[allow(dead_code)]
-    pub anchors: Vec<String>,
     pub rules: Vec<Rule>,
 }
 
@@ -13,30 +11,38 @@ pub struct RuleSet {
 pub struct Rule {
     pub id: String,
     pub source: String,
+    /// Also match these sources in addition to `source` (e.g. Unity Player.log).
+    pub source_any: Option<Vec<String>>,
     pub channel: Option<String>,
     pub provider: Option<String>,
     pub provider_any: Option<Vec<String>>,
     pub event_id: Option<u16>,
     pub event_id_any: Option<Vec<u16>>,
     pub match_field: Option<String>,
+    /// Do not fall back to `detail` when the named field is absent. Needed for
+    /// fields that are derived by a source (e.g. LiveKernelCode in Report.wer).
+    #[serde(default)]
+    pub require_field: bool,
     pub match_value: Option<String>,
     pub match_contains: Option<String>,
     pub match_any: Option<Vec<String>>,
     pub weight: i32,
     pub verdict: String,
-    pub verdict_if_enabled: Option<String>,
-    pub verdict_if_disabled: Option<String>,
     pub confidence: String,
     #[serde(default)]
     pub next_steps: Vec<String>,
     pub link: Option<String>,
-    #[allow(dead_code)]
     pub note: Option<String>,
 }
 
 impl Rule {
     pub fn matches(&self, signal: &crate::model::Signal) -> bool {
-        if self.source != signal.source {
+        let source_ok = self.source == signal.source
+            || self
+                .source_any
+                .as_ref()
+                .is_some_and(|sources| sources.iter().any(|s| s.as_str() == signal.source));
+        if !source_ok {
             return false;
         }
         if let Some(channel) = &self.channel {
@@ -70,6 +76,14 @@ impl Rule {
 
         if self.match_field.as_deref() == Some("LoadedModule") {
             return self.match_loaded_modules(signal);
+        }
+        if self.require_field
+            && self
+                .match_field
+                .as_deref()
+                .is_none_or(|field| signal.get(field).is_none())
+        {
+            return false;
         }
 
         let haystack = self
@@ -132,17 +146,6 @@ impl Rule {
         }
         if self.id == "bugcheck_1001" {
             return bugcheck_headline(signal).unwrap_or_else(|| self.verdict.clone());
-        }
-        if self.id == "mpo_state" {
-            let disabled = signal.get("value") == Some("5");
-            let chosen = if disabled {
-                &self.verdict_if_disabled
-            } else {
-                &self.verdict_if_enabled
-            };
-            if let Some(text) = chosen {
-                return text.clone();
-            }
         }
         self.verdict.clone()
     }
@@ -210,5 +213,7 @@ pub fn bugcheck_headline(signal: &crate::model::Signal) -> Option<String> {
 }
 
 pub fn load() -> RuleSet {
-    toml::from_str(include_str!("../rules.toml")).expect("rules.toml must be valid")
+    let set: RuleSet = toml::from_str(include_str!("../rules.toml")).expect("rules.toml must be valid");
+    assert_eq!(set.version, 1, "unsupported rules.toml version");
+    set
 }

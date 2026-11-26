@@ -20,44 +20,122 @@ pub fn markdown_with_context(analysis: &Analysis, ctx: &SystemContext) -> String
 /// MPO and live overlays are useful only next to GPU/display/game evidence.
 /// A plain service crash must not be polluted with this context.
 fn has_gpu_context(analysis: &Analysis) -> bool {
-    let mut text = String::new();
-    if let Analysis::Results { incidents, .. } = analysis {
-        for incident in incidents {
-            text.push_str(&incident.title);
+    match analysis {
+        Analysis::Results { incidents, .. } => incidents.iter().any(incident_has_gpu_context),
+        _ => false,
+    }
+}
+
+/// Same GPU/display marker set used by the report header and the UI filter.
+pub fn has_gpu_context_text(text: &str) -> bool {
+    let cleaned = without_system_modules(text);
+    let lower = cleaned.to_ascii_lowercase();
+    GPU_CONTEXT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Drops Windows' own DXGI/D3D DLL paths before marker matching. A plain
+/// BugCheck routinely loads System32\dxgi.dll; that is not game evidence.
+fn without_system_modules(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|token| {
+            let normalized = token.to_ascii_lowercase().replace('/', "\\");
+            let name = normalized
+                .rsplit('\\')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+            let in_system_dir = normalized.contains("\\windows\\system32\\")
+                || normalized.contains("\\windows\\syswow64\\");
+            !(in_system_dir && crate::sources::wer::is_system_dll_name(name))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The single GPU/game marker set, shared by the report header and UI filter.
+/// `d3d` is deliberately absent: it matches ordinary system DLL names.
+pub const GPU_CONTEXT_MARKERS: &[&str] = &[
+    "nvlddmkm",
+    "amdkmd",
+    "igfx",
+    "igdkmd",
+    "dxgkrnl",
+    "display 4101",
+    "display driver",
+    "dxgi",
+    "vulkan",
+    "directx",
+    "out of video memory",
+    "tdr",
+    "gpu",
+    "shader",
+    "livekernelevent",
+    "ue_xml",
+    "unity_log",
+    "game_log",
+    "crashcontext",
+    "player.log",
+    "easyanticheat",
+    "battleye",
+    "rtsshooks",
+    "discordhook",
+    "specialk",
+    "reshade",
+    "nvspcap",
+    "unreal",
+    "unity",
+];
+
+/// GPU/display/game context of one incident — used by the UI filter and the
+/// markdown header so the two can never disagree.
+pub fn incident_has_gpu_context(inc: &Incident) -> bool {
+    let mut text = inc.title.clone();
+    text.push('\n');
+    for finding in &inc.findings {
+        text.push_str(&finding.verdict);
+        text.push('\n');
+        for line in &finding.evidence {
+            text.push_str(line);
             text.push('\n');
-            for finding in &incident.findings {
-                text.push_str(&finding.verdict);
-                text.push('\n');
-                for line in &finding.evidence {
-                    text.push_str(line);
-                    text.push('\n');
-                }
-            }
         }
     }
-    let lower = text.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "nvlddmkm",
-        "amdkmd",
-        "igfx",
-        "igdkmd",
-        "display",
-        "dxgkrnl",
-        "d3d",
-        "dxgi",
-        "vulkan",
-        "directx",
-        "out of video memory",
-        "tdr",
-        "gpu",
-        "shader",
-        "game_log",
-        "ue_xml",
-        "unity_log",
-        "unreal",
-        "unity",
-    ];
-    MARKERS.iter().any(|marker| lower.contains(marker))
+    has_gpu_context_text(&text)
+}
+
+/// Human-readable uptime, shared by the report header and the UI header.
+pub fn uptime_label(hours: u64) -> String {
+    if hours >= 168 {
+        format!(
+            "{}d {}h (long uptime / Fast Startup?)",
+            hours / 24,
+            hours % 24
+        )
+    } else if hours >= 24 {
+        format!("{}d {}h", hours / 24, hours % 24)
+    } else {
+        format!("{hours}h")
+    }
+}
+
+/// Noisy event fields that add nothing to a pasted report. The GUI Raw Proof
+/// stays untouched — only `Copy Clean Report` runs evidence through this.
+const REPORT_NOISE_KEYS: &[&str] = &[
+    "apptimestamp=",
+    "moduletimestamp=",
+    "processcreationtime=",
+    "processid=",
+];
+
+pub fn clean_evidence_for_report(line: &str) -> String {
+    line.split_whitespace()
+        .filter(|token| {
+            let lower = token.to_ascii_lowercase();
+            !REPORT_NOISE_KEYS.iter().any(|key| lower.starts_with(key))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// System Context plus exactly one incident — what `Copy Clean Report` uses.
@@ -67,8 +145,16 @@ pub fn markdown_for_incident(
     incident: &Incident,
     note: Option<&str>,
 ) -> String {
+    let mut clean = incident.clone();
+    for finding in &mut clean.findings {
+        finding.evidence = finding
+            .evidence
+            .iter()
+            .map(|line| clean_evidence_for_report(line))
+            .collect();
+    }
     let analysis = Analysis::Results {
-        incidents: vec![incident.clone()],
+        incidents: vec![clean],
         note: note.map(str::to_owned),
     };
     markdown_with_context(&analysis, ctx)
@@ -88,12 +174,28 @@ fn header(ctx: &SystemContext, analysis: &Analysis) -> String {
         ctx.commit_limit_gib,
         redact_safe(&ctx.pagefile)
     ));
+    out.push_str(&format!(
+        "- Uptime: {}\n",
+        uptime_label(ctx.uptime_hours)
+    ));
+    if let Some(warning) = &ctx.disk_warn {
+        out.push_str(&format!("- Storage warning: {}\n", redact_safe(warning)));
+    }
     if has_gpu_context(analysis) {
-        out.push_str(&format!("- MPO: {}\n", ctx.mpo));
+        out.push_str(&format!("- MPO: {}\n", redact_safe(&ctx.mpo)));
+        out.push_str(&format!("- HAGS: {}\n", redact_safe(&ctx.hags)));
+        if let Some(note) = &ctx.tdr_note {
+            out.push_str(&format!("- TDR override: {}\n", redact_safe(note)));
+        }
         if !ctx.overlays_now.is_empty() {
+            let overlays = ctx
+                .overlays_now
+                .iter()
+                .map(|name| redact_safe(name))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push_str(&format!(
-                "- Overlays running now (live state, not crash time): {}\n",
-                ctx.overlays_now.join(", ")
+                "- Overlays running now (live state, not crash time): {overlays}\n"
             ));
         }
     }
@@ -116,15 +218,22 @@ fn markdown_without_context(analysis: &Analysis) -> String {
                     crate::redact::redact(&incident.title)
                 ));
                 for finding in &incident.findings {
-                    out.push_str(&format!("### {} `[{}]`\n\n", finding.verdict, finding.confidence));
+                    out.push_str(&format!(
+                        "### {} `[{}]`\n\n",
+                        crate::redact::redact(&finding.verdict),
+                        finding.confidence
+                    ));
                     out.push_str("Evidence chain:\n\n");
                     for line in &finding.evidence {
                         out.push_str(&format!("- `{}`\n", crate::redact::redact(line)));
                     }
+                    if let Some(note) = &finding.note {
+                        out.push_str(&format!("\n> Note: {}\n", crate::redact::redact(note)));
+                    }
                     if !finding.next_steps.is_empty() {
                         out.push_str("\nNext steps:\n\n");
                         for step in &finding.next_steps {
-                            out.push_str(&format!("1. {step}\n"));
+                            out.push_str(&format!("1. {}\n", crate::redact::redact(step)));
                         }
                     }
                     if let Some(link) = &finding.link {
@@ -172,6 +281,7 @@ mod tests {
                 evidence: Vec::new(),
                 next_steps: Vec::new(),
                 link: None,
+                note: None,
             }],
         }
     }
@@ -248,5 +358,102 @@ mod tests {
         let gpu_md = markdown_with_context(&gpu_analysis, &ctx);
         assert!(gpu_md.contains("- MPO: Enabled (default)"), "{gpu_md}");
         assert!(gpu_md.contains("Overlays running now"), "{gpu_md}");
+        assert!(gpu_md.contains("- HAGS:"), "{gpu_md}");
+        assert!(!plain_md.contains("- HAGS:"), "{plain_md}");
+    }
+
+    #[test]
+    fn gpu_markers_ignore_system_dlls_and_bare_d3d() {
+        let bsod = "BSOD 0x0000000A | wer | WER | \
+                    LoadedModule[1]=C:\\Windows\\System32\\dxgi.dll \
+                    LoadedModule[2]=C:\\Windows\\SysWOW64\\d3d12.dll";
+        assert!(!has_gpu_context_text(bsod), "System32 DLLs are not GPU evidence");
+        assert!(!has_gpu_context_text("Direct3D d3d12.dll"));
+        assert!(has_gpu_context_text(r"D:\Games\Game\dxgi.dll"));
+        assert!(has_gpu_context_text("nvlddmkm GPUID=10de:1b06"));
+    }
+
+    #[test]
+    fn clean_evidence_drops_noise_but_keeps_crash_facts() {
+        let line = "2026-11-25 10:00:00 | eventlog | Application Error | \
+                    AppName=Game.exe AppVersion=1.2 FaultingModuleName=nvlddmkm.sys \
+                    ModuleVersion=2.0 ExceptionCode=c0000005 FaultingOffset=0x1234 \
+                    AppPath=C:\\Games\\Game.exe ModulePath=C:\\Windows\\System32\\nvlddmkm.sys \
+                    AppTimeStamp=12345678 ModuleTimeStamp=87654321 \
+                    ProcessCreationTime=2026-11-25T09:59:00Z ProcessId=4242";
+        let clean = clean_evidence_for_report(line);
+        for kept in [
+            "AppName=Game.exe",
+            "AppVersion=1.2",
+            "FaultingModuleName=nvlddmkm.sys",
+            "ModuleVersion=2.0",
+            "ExceptionCode=c0000005",
+            "FaultingOffset=0x1234",
+            "AppPath=",
+            "ModulePath=",
+        ] {
+            assert!(clean.contains(kept), "missing {kept}: {clean}");
+        }
+        for noise in [
+            "AppTimeStamp=",
+            "ModuleTimeStamp=",
+            "ProcessCreationTime=",
+            "ProcessId=",
+            "4242",
+        ] {
+            assert!(!clean.contains(noise), "noise leaked: {clean}");
+        }
+    }
+
+    #[test]
+    fn context_shows_uptime_storage_hags_and_tdr() {
+        let ctx = SystemContext {
+            cpu: "CPU Test".to_owned(),
+            gpu: "GPU Test".to_owned(),
+            hags: "Enabled".to_owned(),
+            tdr_note: Some("TdrLevel=0 (recovery disabled!)".to_owned()),
+            disk_warn: Some("Low free space on E:: 6.4 GiB free".to_owned()),
+            uptime_hours: 200,
+            ..Default::default()
+        };
+        let md = markdown_with_context(
+            &Analysis::Results {
+                incidents: vec![incident("Game.exe", "GPU driver timeout")],
+                note: None,
+            },
+            &ctx,
+        );
+        assert!(
+            md.contains("- Uptime: 8d 8h (long uptime / Fast Startup?)"),
+            "{md}"
+        );
+        assert!(
+            md.contains("- Storage warning: Low free space on E:: 6.4 GiB free"),
+            "{md}"
+        );
+        assert!(md.contains("- HAGS: Enabled"), "{md}");
+        assert!(
+            md.contains("- TDR override: TdrLevel=0 (recovery disabled!)"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn copy_report_cleans_noisy_evidence() {
+        let ctx = SystemContext {
+            cpu: "CPU Test".to_owned(),
+            ..Default::default()
+        };
+        let mut selected = incident("Game.exe", "GPU driver timeout");
+        selected.findings[0].evidence.push(
+            "2026-11-25 10:00:00 | eventlog | Application Error | \
+             AppName=Game.exe ExceptionCode=c0000005 ProcessId=4242"
+                .to_owned(),
+        );
+        let md = markdown_for_incident(&ctx, &selected, None);
+        assert!(md.contains("AppName=Game.exe"), "{md}");
+        assert!(md.contains("ExceptionCode=c0000005"), "{md}");
+        assert!(!md.contains("ProcessId="), "{md}");
+        assert!(!md.contains("4242"), "{md}");
     }
 }

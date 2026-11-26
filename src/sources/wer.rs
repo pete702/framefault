@@ -8,10 +8,10 @@ use walkdir::WalkDir;
 
 use crate::model::Signal;
 
-/// C:\Windows\System32\dxgi.dll is Windows itself, not ReShade.
+/// Any `<drive>:\Windows\System32\dxgi.dll` is Windows itself, not ReShade.
 pub fn is_system_dll_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase().replace('/', "\\");
-    p.starts_with("c:\\windows\\system32\\") || p.starts_with("c:\\windows\\syswow64\\")
+    p.contains("\\windows\\system32\\") || p.contains("\\windows\\syswow64\\")
 }
 
 pub fn is_system_dll_name(name: &str) -> bool {
@@ -63,10 +63,12 @@ pub fn scan(root: &Path) -> Vec<Signal> {
         collect_wer_dir(&programdata.join(dir), &mut add);
     }
 
-    files.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    // Newest first; path breaks ties so the 25-file cap is deterministic
+    // regardless of directory enumeration order.
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     files
         .into_iter()
-        .take(6)
+        .take(25)
         .filter_map(|(p, _)| parse(&p))
         .collect()
 }
@@ -102,6 +104,55 @@ fn read_wer_text(path: &Path) -> Option<String> {
     }
 }
 
+/// LiveKernelEvent 141 must be proven by the report itself, never inferred
+/// from a stray "141" in a version, path, timestamp or module name.
+fn live_kernel_141_code(
+    text: &str,
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<&'static str> {
+    let is_live_kernel = fields.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case("EventType") && value.trim().eq_ignore_ascii_case("LiveKernelEvent")
+    });
+    if !is_live_kernel {
+        return None;
+    }
+
+    const CODE_KEYS: [&str; 4] = ["P1", "Code", "Sig[0].Value", "ProblemSignature"];
+    let has_code = CODE_KEYS.iter().any(|key| {
+        fields
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(key))
+            .is_some_and(|(_, value)| {
+                value
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|token| token.eq_ignore_ascii_case("141"))
+            })
+    });
+    if has_code || text.to_ascii_lowercase().contains("lkd_0x141") {
+        Some("141")
+    } else {
+        None
+    }
+}
+
+/// WER has shipped several casings of the same timestamp keys over the years.
+fn report_time(fields: &std::collections::HashMap<String, String>) -> Option<DateTime<chrono::Local>> {
+    [
+        "ReportCreateTimeStamp",
+        "TimeCreated",
+        "ReportTime",
+        "EventTime",
+        "Timestamp",
+    ]
+    .iter()
+    .find_map(|key| {
+        fields
+            .iter()
+            .find(|(field, _)| field.eq_ignore_ascii_case(key))
+            .and_then(|(_, value)| crate::model::parse_timestamp(value))
+    })
+}
+
 fn parse(path: &Path) -> Option<Signal> {
     let text = read_wer_text(path)?;
     let mtime = fs::metadata(path)
@@ -111,33 +162,109 @@ fn parse(path: &Path) -> Option<Signal> {
 
     let mut fields = std::collections::HashMap::new();
     let mut modules = Vec::new();
+    // Evidence shows event fields and third-party modules only. The complete
+    // path list stays in `loaded_modules` for overlay rules, but dozens of
+    // Windows System32/SysWOW64 DLLs must not pollute the report nor make a
+    // plain BSOD look like a GPU/game incident.
+    let mut detail_lines: Vec<String> = Vec::new();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else { continue };
         let key = key.trim();
         let value = value.trim();
         if key.to_ascii_lowercase().starts_with("loadedmodule") {
             modules.push(value.to_owned());
+            if !is_system_dll_path(value) {
+                detail_lines.push(format!("{key}={value}"));
+            }
         } else {
+            detail_lines.push(format!("{key}={value}"));
             fields.insert(key.to_owned(), value.to_owned());
         }
     }
 
     // Real crash time from inside the report, mtime only as a fallback.
-    let time = [
-        "ReportCreateTimeStamp",
-        "TimeCreated",
-        "ReportTime",
-        "EventTime",
-        "Timestamp",
-    ]
-    .iter()
-    .find_map(|key| fields.get(*key).and_then(|value| crate::model::parse_timestamp(value)))
-    .or(mtime)?;
+    let time = report_time(&fields).or(mtime)?;
+
+    if let Some(code) = live_kernel_141_code(&text, &fields) {
+        fields.insert("LiveKernelCode".to_owned(), code.to_owned());
+    }
 
     let mut signal = Signal::new("wer", time);
     signal.provider = "WER".to_owned();
-    signal.detail = text;
+    signal.detail = detail_lines.join("\n");
     signal.fields = fields;
     signal.loaded_modules = modules;
     Some(signal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn report_time_keys_are_case_insensitive() {
+        let mut fields = std::collections::HashMap::new();
+        fields.insert(
+            "reportcreatetimestamp".to_owned(),
+            "2026-11-25T10:00:00".to_owned(),
+        );
+        let parsed = report_time(&fields).expect("lowercase timestamp key must be accepted");
+        assert_eq!(parsed.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-11-25 10:00:00");
+
+        fields.clear();
+        fields.insert("EventTime".to_owned(), "not a date".to_owned());
+        assert!(report_time(&fields).is_none());
+    }
+
+    #[test]
+    fn system_dll_paths_work_on_any_windows_drive() {
+        for path in [
+            r"C:\Windows\System32\dxgi.dll",
+            r"D:\Windows\System32\dxgi.dll",
+            r"E:\Windows\SysWOW64\d3d12.dll",
+        ] {
+            assert!(is_system_dll_path(path), "must be system: {path}");
+        }
+        assert!(!is_system_dll_path(r"D:\Games\Game\dxgi.dll"));
+        assert!(!is_system_dll_path(r"D:\MyWindows\System32\dxgi.dll"));
+    }
+
+    #[test]
+    fn live_kernel_code_requires_a_live_kernel_event() {
+        let live = fields(&[("EventType", "livekernelevent")]);
+        assert_eq!(
+            live_kernel_141_code("BugCheck LKD_0x141: video engine timeout", &live),
+            Some("141")
+        );
+
+        let wrong_type = fields(&[("EventType", "ApplicationCrash"), ("Code", "141")]);
+        assert_eq!(
+            live_kernel_141_code("BugCheck LKD_0x141: video engine timeout", &wrong_type),
+            None
+        );
+    }
+
+    #[test]
+    fn live_kernel_code_uses_named_signature_fields() {
+        let live = fields(&[("EventType", "LiveKernelEvent")]);
+        let with_version = fields(&[
+            ("EventType", "LiveKernelEvent"),
+            ("AppVersion", "1.41.0"),
+            ("AppPath", r"C:\Apps\141\Game.exe"),
+        ]);
+        assert_eq!(live_kernel_141_code("plain crash", &with_version), None);
+
+        for key in ["P1", "Code", "Sig[0].Value", "ProblemSignature"] {
+            let with_code = fields(&[("EventType", "LiveKernelEvent"), (key, "141")]);
+            assert_eq!(live_kernel_141_code("plain crash", &with_code), Some("141"));
+        }
+        assert_eq!(live_kernel_141_code("plain crash", &live), None);
+    }
 }

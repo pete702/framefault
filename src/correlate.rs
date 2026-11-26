@@ -3,14 +3,64 @@ use std::collections::{HashMap, HashSet};
 use crate::model::{Analysis, Finding, Incident, Signal};
 use crate::rules::RuleSet;
 
-/// Groups signals into incidents. Anchors closer together than `window_sec`
-/// are merged so the same crash produces one card, not three.
+/// System events that are a crash on their own, even without a WER report or
+/// an Event 1000 next to them.
+const CRITICAL_IDS: &[u16] = &[1001, 41, 17, 18, 19, 153, 4101, 2004];
+
+fn group_anchors(anchors: Vec<&Signal>, window: i64) -> Vec<Vec<&Signal>> {
+    let mut groups: Vec<Vec<&Signal>> = Vec::new();
+    for anchor in anchors {
+        if let Some(group) = groups.last_mut() {
+            if (anchor.t - group[0].t).num_seconds().abs() <= window {
+                group.push(anchor);
+                continue;
+            }
+        }
+        groups.push(vec![anchor]);
+    }
+    groups
+}
+
+/// All signals belonging to one crash window: the anchors themselves plus
+/// anything within `window_sec` of the whole anchor range, not just the
+/// first anchor. `skip` keeps fallback groups from duplicating signals
+/// already claimed by a primary group.
+fn expand_group<'a>(
+    anchors: &[&'a Signal],
+    signals: &'a [Signal],
+    ruleset: &RuleSet,
+    skip: &HashSet<*const Signal>,
+) -> Vec<&'a Signal> {
+    let earliest = anchors.iter().map(|s| s.t).min().expect("empty anchor group");
+    let latest = anchors.iter().map(|s| s.t).max().expect("empty anchor group");
+    let span = chrono::Duration::seconds(ruleset.window_sec);
+    let lower = earliest - span;
+    let upper = latest + span;
+    let mut nearby: Vec<&Signal> = anchors.to_vec();
+    for signal in signals.iter().filter(|s| s.t >= lower && s.t <= upper) {
+        if skip.contains(&(signal as *const Signal)) {
+            continue;
+        }
+        if !nearby
+            .iter()
+            .any(|existing| std::ptr::eq(*existing, signal))
+        {
+            nearby.push(signal);
+        }
+    }
+    nearby.sort_by_key(|s| s.t);
+    nearby
+}
+
+/// Groups signals into incidents. Primary anchors (WER, UE/Unity/game logs,
+/// Event 1000) are preferred; critical system events that did not fall into
+/// any primary window become fallback anchors instead of being dropped.
 pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
     if signals.is_empty() {
         return Analysis::Empty;
     }
 
-    let mut anchors: Vec<&Signal> = signals
+    let mut primary: Vec<&Signal> = signals
         .iter()
         .filter(|s| {
             s.source == "wer"
@@ -20,61 +70,79 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
                 || (s.source == "eventlog" && s.event_id == Some(1000))
         })
         .collect();
-    anchors.sort_by_key(|s| s.t);
+    primary.sort_by_key(|s| s.t);
 
-    if anchors.is_empty() {
+    let mut secondary: Vec<&Signal> = signals
+        .iter()
+        .filter(|s| {
+            s.source == "eventlog"
+                && matches!(s.event_id, Some(id) if CRITICAL_IDS.contains(&id))
+        })
+        .collect();
+    secondary.sort_by_key(|s| s.t);
+
+    if primary.is_empty() && secondary.is_empty() {
         return Analysis::NoAnchor;
     }
 
-    let mut groups: Vec<Vec<&Signal>> = Vec::new();
-    for anchor in anchors {
-        if let Some(group) = groups.last_mut() {
-            let last = group[0];
-            if (anchor.t - last.t).num_seconds().abs() <= ruleset.window_sec * 2 {
-                group.push(anchor);
-                continue;
-            }
+    let window = ruleset.window_sec * 2;
+    let mut work: Vec<_> = Vec::new();
+    let mut consumed: HashSet<*const Signal> = HashSet::new();
+
+    for group in group_anchors(primary, window) {
+        let nearby = expand_group(&group, signals, ruleset, &HashSet::new());
+        for signal in &nearby {
+            consumed.insert(*signal as *const Signal);
         }
-        groups.push(vec![anchor]);
+        work.push((nearby, group[0].t, false));
+    }
+
+    let leftover: Vec<&Signal> = secondary
+        .into_iter()
+        .filter(|s| !consumed.contains(&(*s as *const Signal)))
+        .collect();
+    for group in group_anchors(leftover, window) {
+        work.push((expand_group(&group, signals, ruleset, &consumed), group[0].t, true));
     }
 
     let mut incidents = Vec::new();
-    for group in groups {
-        let anchor = group[0];
-        let mut nearby: Vec<&Signal> = group.clone();
-        for signal in signals.iter().filter(|s| {
-            s.source == "registry" || (s.t - anchor.t).num_seconds().abs() <= ruleset.window_sec
-        }) {
-            if !nearby
-                .iter()
-                .any(|existing| std::ptr::eq(*existing, signal))
-            {
-                nearby.push(signal);
-            }
-        }
-        nearby.sort_by_key(|s| s.t);
-
+    for (nearby, time, is_fallback) in work {
         let findings = findings_from(&nearby, ruleset);
         if findings.is_empty() {
             continue;
         }
 
-        let title = nearby
-            .iter()
-            .find_map(|signal| {
-                crate::rules::headline(signal).or_else(|| crate::rules::bugcheck_headline(signal))
-            })
-            .or_else(|| {
-                nearby
-                    .iter()
-                    .find(|s| !s.provider.is_empty() && s.source != "registry")
-                    .map(|s| s.provider.clone())
-            })
-            .unwrap_or_else(|| "Crash incident".to_owned());
+        let title = if is_fallback {
+            nearby
+                .iter()
+                .find_map(|signal| crate::rules::bugcheck_headline(signal))
+                .or_else(|| findings.first().map(|f| f.verdict.clone()))
+                .or_else(|| {
+                    nearby
+                        .iter()
+                        .find(|s| !s.provider.is_empty())
+                        .map(|s| s.provider.clone())
+                })
+                .unwrap_or_else(|| "Crash incident".to_owned())
+        } else {
+            nearby
+                .iter()
+                .find_map(|signal| {
+                    crate::rules::headline(signal)
+                        .or_else(|| crate::rules::bugcheck_headline(signal))
+                })
+                .or_else(|| {
+                    nearby
+                        .iter()
+                        .find(|s| !s.provider.is_empty())
+                        .map(|s| s.provider.clone())
+                })
+                .unwrap_or_else(|| "Crash incident".to_owned())
+        };
 
         incidents.push(Incident {
             title,
-            time: anchor.t,
+            time,
             findings,
         });
     }
@@ -119,14 +187,22 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
                 evidence: Vec::new(),
                 next_steps: rule.next_steps.clone(),
                 link: rule.link.clone(),
+                note: rule.note.clone(),
             });
             entry.score += rule.weight;
             if !entry.evidence.contains(&evidence) {
                 entry.evidence.push(evidence);
             }
-            if (rule.id == "bugcheck_1001" || rule.id == "kernel_power_41")
-                && entry.next_steps.is_empty()
-            {
+            if rule.id == "kernel_power_41" {
+                // A recorded non-zero bugcheck is a real BSOD: the generic
+                // "check the PSU" steps must give way to the decoded stop code.
+                match crate::rules::bugcheck_code(signal) {
+                    Some(code) if code != 0 => {
+                        entry.next_steps = vec![crate::codes::decode(code).1.to_owned()];
+                    }
+                    _ => entry.next_steps = rule.next_steps.clone(),
+                }
+            } else if rule.id == "bugcheck_1001" && entry.next_steps.is_empty() {
                 if let Some(code) = crate::rules::bugcheck_code(signal) {
                     entry
                         .next_steps
@@ -135,7 +211,7 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
             }
             if rule.id == "application_error_1000" && entry.next_steps.is_empty() {
                 if let Some(raw) = signal.get("ExceptionCode") {
-                    if let Some(code) = crate::codes::parse_code(raw) {
+                    if let Some(code) = crate::codes::parse_exception_code(raw) {
                         entry
                             .next_steps
                             .push(crate::codes::decode_exception(code).1.to_owned());

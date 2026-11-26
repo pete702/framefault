@@ -7,16 +7,12 @@ pub fn redact(input: &str) -> String {
     out = mask_profile_paths(&out);
     out = mask_guid(&out);
     out = mask_sid(&out);
+    out = mask_ipv6(&out);
     out = mask_ipv4(&out);
     out = mask_env_secret(&out, "USERNAME", "[REDACTED-USER]");
     out = mask_env_secret(&out, "COMPUTERNAME", "[REDACTED-HOST]");
     out = mask_serialish(&out);
     out
-}
-
-/// Context lines are built from hardware facts only; still scrubbed defensively.
-pub fn context_line(label: &str, value: &str) -> String {
-    format!("- {label}: {}", redact(value))
 }
 
 fn is_token_char(c: char) -> bool {
@@ -72,7 +68,10 @@ fn mask_profile_paths(input: &str) -> String {
     out
 }
 
+/// Masks the whole UNC path, including every directory and file name after
+/// the share — otherwise the last component can still be a username.
 fn mask_unc_servers(input: &str) -> String {
+    const REPLACEMENT: &str = "[REDACTED-UNC]";
     let mut out = input.to_string();
     for marker in ["\\\\", "//"] {
         let mut cursor = 0usize;
@@ -85,18 +84,62 @@ fn mask_unc_servers(input: &str) -> String {
                 continue;
             }
             let body_start = start + marker.len();
-            let Some(server_end) = out[body_start..].find(['\\', '/']) else {
-                break;
-            };
-            let share_start = body_start + server_end + 1;
-            let Some(share_end) = out[share_start..].find(['\\', '/']) else {
-                break;
-            };
-            let end = share_start + share_end;
-            let replacement = format!("{marker}%UNC%");
-            out.replace_range(start..end, &replacement);
-            cursor = start + replacement.len();
+            let end = out[body_start..]
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '|')
+                })
+                .map(|offset| body_start + offset)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, REPLACEMENT);
+            cursor = start + REPLACEMENT.len();
         }
+    }
+    out
+}
+
+fn is_ipv6_char(c: char) -> bool {
+    c.is_ascii_hexdigit() || c == ':' || c == '.'
+}
+
+/// `HH:MM:SS` and `C:\...` have too few colons; a MAC-like `10de:1b06` has
+/// one. Real IPv6 has `::` or at least three colons plus hex groups.
+fn is_ipv6_address(token: &str) -> bool {
+    let colons = token.chars().filter(|&c| c == ':').count();
+    if !(token.contains("::") || colons >= 3) || !token.chars().any(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    // A doubled colon after a drive letter ("E:: 6.4 GiB free") is not an
+    // address: require real groups on both sides of `::` (or a leading `::`).
+    if let Some(pos) = token.find("::") {
+        let right = &token[pos + 2..];
+        if right.is_empty() && !token.starts_with("::") {
+            return false;
+        }
+    }
+    true
+}
+
+fn mask_ipv6(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if is_ipv6_char(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_ipv6_char(chars[i]) {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            if is_ipv6_address(&token) {
+                out.push_str("[REDACTED-IPV6]");
+            } else {
+                out.push_str(&token);
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }
@@ -269,6 +312,38 @@ mod tests {
         assert!(out.contains(r"D:\Users\%USERPROFILE%\Saved"));
         assert!(!out.contains("nas01"));
         assert!(!out.contains("profiles"));
+        assert!(!out.contains("alice"), "UNC tail leaked: {out}");
+        assert!(out.contains("[REDACTED-UNC]"), "{out}");
+    }
+
+    #[test]
+    fn every_unc_path_is_masked_but_urls_and_times_are_untouched() {
+        let out = redact(
+            r"\\nas01\profiles\alice\crash.log and \\other\share\bob\dump.dmp at 17:17:46",
+        );
+        assert_eq!(out.matches("[REDACTED-UNC]").count(), 2, "{out}");
+        for leaked in ["nas01", "alice", "other", "share", "bob", "dump.dmp"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(out.contains("17:17:46"), "time was destroyed: {out}");
+
+        let url = "https://github.com/pete702/framefault";
+        assert_eq!(redact(url), url);
+    }
+
+    #[test]
+    fn ipv6_addresses_are_masked_without_breaking_times_or_windows_paths() {
+        let out = redact(
+            "client fe80::1%eth0 fd00::1234 ::1 2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        );
+        assert_eq!(out.matches("[REDACTED-IPV6]").count(), 4, "{out}");
+        for leaked in ["fe80", "fd00", "2001", "0db8", "0370"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+
+        let keep = "2026-11-25 17:17:46 | C:\\Windows\\System32\\dxgi.dll | \
+                    0x00000116 | Low free space on E:: 6.4 GiB free";
+        assert_eq!(redact(keep), keep, "non-IP tokens must survive: {out}");
     }
 
     #[test]
@@ -300,11 +375,12 @@ mod tests {
         ] {
             let out = redact(url);
             assert_eq!(out, url, "URL must stay intact: {out}");
-            assert!(!out.contains("%UNC%"), "URL must not be masked: {out}");
+            assert!(!out.contains("[REDACTED-UNC]"), "URL must not be masked: {out}");
         }
 
         let out = redact(r"\\NAS\share\user");
-        assert!(out.contains(r"\\%UNC%"), "UNC share must be masked: {out}");
+        assert_eq!(out, "[REDACTED-UNC]");
         assert!(!out.contains("NAS"), "UNC server must be destroyed: {out}");
+        assert!(!out.contains("user"), "UNC tail must be destroyed: {out}");
     }
 }

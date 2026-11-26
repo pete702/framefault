@@ -36,7 +36,7 @@ const TABLE: &[(u32, &str, &str)] = &[
 const EXCEPTIONS: &[(u32, &str, &str)] = &[
     (0xC000_0005, "ACCESS_VIOLATION", "Invalid memory access: mod, overlay, driver or corrupted install."),
     (0xC000_0409, "STACK_BUFFER_OVERRUN", "Stack corruption: usually a native plugin/mod or VC++ runtime."),
-    (0xE06D_7363, "CPP_EH_EXCEPTION", "Unhandled C++ exception from the faulting module: often a game/plugin bug."),
+    (0xE06D_7363, "CPP_EH_EXCEPTION", "Unhandled C++ exception — usually an application/plugin bug or corrupt/missing Visual C++ Redistributable."),
     (0x8000_0003, "STATUS_BREAKPOINT", "Breakpoint/assert inside the app: often an internal error or memory pressure in Chromium/Electron apps; also debug builds and launchers."),
     (0xC000_00FD, "STACK_OVERFLOW", "Guard page could not be created: recursion or deep call chain."),
     (0x887A_0005, "DXGI_ERROR_DEVICE_REMOVED", "GPU device removed: driver timeout, TDR, or VRAM exhaustion."),
@@ -101,6 +101,26 @@ pub fn parse_code(text: &str) -> Option<u32> {
     None
 }
 
+/// Parses an ExceptionCode field as Windows actually emits it: either a
+/// `0x`-prefixed token or a bare hex token such as `e06d7363` / `c0000005`.
+/// Kept separate from [`parse_code`] so the bugcheck parser stays strict and
+/// never mistakes an ordinary word for a code.
+pub fn parse_exception_code(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let hex = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    if (1..=8).contains(&hex.len()) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(hex, 16).ok().filter(|code| *code > 0)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +142,20 @@ mod tests {
     fn parses_hex_and_decimal() {
         assert_eq!(parse_code("The Bug Check was: 0x00000116 (0xffff)"), Some(0x116));
         assert_eq!(parse_code("BugcheckCode 159"), Some(159));
+    }
+
+    #[test]
+    fn parses_exception_codes_with_and_without_prefix() {
+        assert_eq!(parse_exception_code("e06d7363"), Some(0xE06D_7363));
+        assert_eq!(parse_exception_code("0xc0000005"), Some(0xC000_0005));
+        assert_eq!(parse_exception_code("80000003"), Some(0x8000_0003));
+        assert_eq!(parse_exception_code("0X00000116"), Some(0x116));
+        assert_eq!(parse_exception_code("not a code"), None);
+        assert_eq!(parse_exception_code("0"), None);
+    }
+
+    #[test]
+    fn strict_bugcheck_parser_ignores_bare_hex_words() {
+        assert_eq!(parse_code("e06d7363"), None);
     }
 }
