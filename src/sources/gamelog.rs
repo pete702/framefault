@@ -105,7 +105,7 @@ pub fn scan(root: &Path) -> Vec<Signal> {
         }
     }
 
-    found.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     found
         .into_iter()
         .take(10)
@@ -114,7 +114,10 @@ pub fn scan(root: &Path) -> Vec<Signal> {
 }
 
 fn parse(path: &Path) -> Option<Signal> {
-    let text = fs::read_to_string(path).ok()?;
+    // Game logs on non-English Windows are often ANSI/Windows-1252; a single
+    // invalid byte must not discard the whole crash log.
+    let bytes = fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
     let time = fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -122,7 +125,11 @@ fn parse(path: &Path) -> Option<Signal> {
 
     let mut matched = Vec::new();
     for line in text.lines().rev().take(2000) {
-        if MARKERS.iter().any(|m| line.contains(m)) {
+        let lower = line.to_ascii_lowercase();
+        if MARKERS
+            .iter()
+            .any(|marker| lower.contains(&marker.to_ascii_lowercase()))
+        {
             matched.push(line.to_owned());
         }
     }

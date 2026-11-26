@@ -3,9 +3,9 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "framefault", about = "FrameFault headless / CI mode")]
+#[command(name = "framefault", about = "FrameFault headless / CI mode", version)]
 struct Args {
-    #[arg(long)]
+    #[arg(long, alias = "self_test")]
     self_test: bool,
 
     #[arg(value_name = "PATH")]
@@ -20,6 +20,10 @@ struct Args {
 
 pub fn maybe_run() -> bool {
     let args = Args::parse();
+    if args.days < 1 {
+        eprintln!("--days must be >= 1");
+        std::process::exit(2);
+    }
     if args.self_test {
         match crate::self_test() {
             Ok(()) => {

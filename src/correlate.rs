@@ -31,8 +31,16 @@ fn expand_group<'a>(
     ruleset: &RuleSet,
     skip: &HashSet<*const Signal>,
 ) -> Vec<&'a Signal> {
-    let earliest = anchors.iter().map(|s| s.t).min().expect("empty anchor group");
-    let latest = anchors.iter().map(|s| s.t).max().expect("empty anchor group");
+    let earliest = anchors
+        .iter()
+        .map(|s| s.t)
+        .min()
+        .expect("empty anchor group");
+    let latest = anchors
+        .iter()
+        .map(|s| s.t)
+        .max()
+        .expect("empty anchor group");
     let span = chrono::Duration::seconds(ruleset.window_sec);
     let lower = earliest - span;
     let upper = latest + span;
@@ -50,6 +58,24 @@ fn expand_group<'a>(
     }
     nearby.sort_by_key(|s| s.t);
     nearby
+}
+
+/// Drop anchors already claimed by an earlier group, then return the newest
+/// remaining anchor and its full window. This prevents overlapping primary
+/// groups from putting the same signal into two incidents.
+fn take_group<'a>(
+    group: Vec<&'a Signal>,
+    signals: &'a [Signal],
+    ruleset: &RuleSet,
+    consumed: &HashSet<*const Signal>,
+) -> Option<(Vec<&'a Signal>, &'a Signal)> {
+    let anchors: Vec<&Signal> = group
+        .into_iter()
+        .filter(|signal| !consumed.contains(&(*signal as *const Signal)))
+        .collect();
+    let newest = *anchors.last()?;
+    let nearby = expand_group(&anchors, signals, ruleset, consumed);
+    Some((nearby, newest))
 }
 
 /// Groups signals into incidents. Primary anchors (WER, UE/Unity/game logs,
@@ -75,14 +101,13 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
     let mut secondary: Vec<&Signal> = signals
         .iter()
         .filter(|s| {
-            s.source == "eventlog"
-                && matches!(s.event_id, Some(id) if CRITICAL_IDS.contains(&id))
+            s.source == "eventlog" && matches!(s.event_id, Some(id) if CRITICAL_IDS.contains(&id))
         })
         .collect();
     secondary.sort_by_key(|s| s.t);
 
     if primary.is_empty() && secondary.is_empty() {
-        return Analysis::NoAnchor;
+        return Analysis::NoAnchor { note: None };
     }
 
     let window = ruleset.window_sec * 2;
@@ -90,11 +115,12 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
     let mut consumed: HashSet<*const Signal> = HashSet::new();
 
     for group in group_anchors(primary, window) {
-        let nearby = expand_group(&group, signals, ruleset, &HashSet::new());
-        for signal in &nearby {
-            consumed.insert(*signal as *const Signal);
+        if let Some((nearby, newest)) = take_group(group, signals, ruleset, &consumed) {
+            for signal in &nearby {
+                consumed.insert(*signal as *const Signal);
+            }
+            work.push((nearby, newest.t, false));
         }
-        work.push((nearby, group[0].t, false));
     }
 
     let leftover: Vec<&Signal> = secondary
@@ -102,7 +128,12 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
         .filter(|s| !consumed.contains(&(*s as *const Signal)))
         .collect();
     for group in group_anchors(leftover, window) {
-        work.push((expand_group(&group, signals, ruleset, &consumed), group[0].t, true));
+        if let Some((nearby, newest)) = take_group(group, signals, ruleset, &consumed) {
+            for signal in &nearby {
+                consumed.insert(*signal as *const Signal);
+            }
+            work.push((nearby, newest.t, true));
+        }
     }
 
     let mut incidents = Vec::new();
@@ -149,7 +180,7 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
 
     incidents.sort_by_key(|incident| std::cmp::Reverse(incident.time));
     if incidents.is_empty() {
-        return Analysis::NoAnchor;
+        return Analysis::NoAnchor { note: None };
     }
     Analysis::Results {
         incidents,
@@ -167,7 +198,10 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
                 continue;
             }
             let verdict = rule.verdict_for(signal);
-            sources.entry(verdict.clone()).or_default().insert(signal.source);
+            sources
+                .entry(verdict.clone())
+                .or_default()
+                .insert(signal.source);
             let evidence = format!(
                 "{} | {} | {} | {}",
                 signal.t.format("%Y-%m-%d %H:%M:%S"),
@@ -242,8 +276,7 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
     }
 
     let mut findings: Vec<Finding> = grouped.into_values().collect();
-    findings.sort_by_key(|finding| std::cmp::Reverse(finding.score));
+    findings.sort_by_key(|finding| (std::cmp::Reverse(finding.score), finding.verdict.clone()));
     findings.truncate(12);
     findings
 }
-

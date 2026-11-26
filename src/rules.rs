@@ -19,10 +19,6 @@ pub struct Rule {
     pub event_id: Option<u16>,
     pub event_id_any: Option<Vec<u16>>,
     pub match_field: Option<String>,
-    /// Do not fall back to `detail` when the named field is absent. Needed for
-    /// fields that are derived by a source (e.g. LiveKernelCode in Report.wer).
-    #[serde(default)]
-    pub require_field: bool,
     pub match_value: Option<String>,
     pub match_contains: Option<String>,
     pub match_any: Option<Vec<String>>,
@@ -77,21 +73,17 @@ impl Rule {
         if self.match_field.as_deref() == Some("LoadedModule") {
             return self.match_loaded_modules(signal);
         }
-        if self.require_field
-            && self
-                .match_field
-                .as_deref()
-                .is_none_or(|field| signal.get(field).is_none())
-        {
-            return false;
-        }
 
-        let haystack = self
-            .match_field
-            .as_deref()
-            .and_then(|field| signal.get(field))
-            .unwrap_or(&signal.detail)
-            .to_ascii_lowercase();
+        // A named field is strict: a missing bIsOOM must not fall back to the
+        // whole detail and match an unrelated "IsEnsure=true".
+        let haystack = match self.match_field.as_deref() {
+            None | Some("detail") => &signal.detail,
+            Some(field) => match signal.get(field) {
+                Some(value) => value,
+                None => return false,
+            },
+        }
+        .to_ascii_lowercase();
 
         if let Some(value) = &self.match_value {
             if !haystack.contains(&value.to_ascii_lowercase()) {
@@ -154,9 +146,7 @@ impl Rule {
 fn detail_field(detail: &str, label: &str) -> Option<String> {
     let from = detail.find(label)? + label.len();
     let rest = detail[from..].trim_start();
-    let end = rest
-        .find([',', '\n', '\r', ';'])
-        .unwrap_or(rest.len());
+    let end = rest.find([',', '\n', '\r', ';']).unwrap_or(rest.len());
     Some(rest[..end].trim().to_owned())
 }
 
@@ -171,6 +161,7 @@ pub fn headline(signal: &crate::model::Signal) -> Option<String> {
     let module = signal
         .get("FaultingModuleName")
         .or_else(|| signal.get("ModuleName"))
+        .or_else(|| signal.get("FaultingModule"))
         .map(str::to_owned)
         .or_else(|| detail_field(&signal.detail, "Faulting module name:"));
     let code = signal
@@ -192,20 +183,43 @@ pub fn headline(signal: &crate::model::Signal) -> Option<String> {
     if let Some(raw_code) = code {
         if let Some(value) = crate::codes::parse_code(&raw_code) {
             let (name, _) = crate::codes::decode_exception(value);
-            return Some(format!(
-                "{process} - 0x{value:08X} {name} ({module})"
-            ));
+            return Some(format!("{process} - 0x{value:08X} {name} ({module})"));
         }
         return Some(format!("{process} - {raw_code} ({module})"));
     }
     Some(format!("{process} - ? ({module})"))
 }
 
+/// Decimal code after an explicit BugcheckCode label; `=` and `:` are valid
+/// separators in Event XML, a space in wevtutil text output.
+fn labelled_bugcheck(text: &str) -> Option<u32> {
+    ["BugcheckCode", "BugCheckCode", "Bugcheck code"]
+        .iter()
+        .find_map(|label| {
+            let index = text.find(label)?;
+            let rest = text[index + label.len()..]
+                .trim_start_matches(|c: char| c == '=' || c == ':' || c.is_whitespace());
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok().filter(|code| *code > 0)
+        })
+}
+
 /// Short, human headline for a bugcheck: decoded stop code.
 pub fn bugcheck_code(signal: &crate::model::Signal) -> Option<u32> {
-    let direct = signal.get("BugcheckCode").unwrap_or("");
-    let combined = format!("{direct} {}", signal.detail);
-    crate::codes::parse_code(&combined)
+    // The explicit field is authoritative. BugcheckParameter1=0x... must never
+    // win over BugcheckCode=59.
+    if let Some(raw) = signal.get("BugcheckCode") {
+        let raw = raw.trim();
+        return raw
+            .parse::<u32>()
+            .ok()
+            .or_else(|| crate::codes::parse_code(raw))
+            .filter(|code| *code > 0);
+    }
+    if let Some(code) = labelled_bugcheck(&signal.detail) {
+        return Some(code);
+    }
+    crate::codes::parse_code(&signal.detail)
 }
 
 pub fn bugcheck_headline(signal: &crate::model::Signal) -> Option<String> {
@@ -213,7 +227,8 @@ pub fn bugcheck_headline(signal: &crate::model::Signal) -> Option<String> {
 }
 
 pub fn load() -> RuleSet {
-    let set: RuleSet = toml::from_str(include_str!("../rules.toml")).expect("rules.toml must be valid");
+    let set: RuleSet =
+        toml::from_str(include_str!("../rules.toml")).expect("rules.toml must be valid");
     assert_eq!(set.version, 1, "unsupported rules.toml version");
     set
 }

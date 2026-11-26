@@ -83,7 +83,10 @@ pub enum Analysis {
         incidents: Vec<Incident>,
         note: Option<String>,
     },
-    NoAnchor,
+    NoAnchor {
+        /// Ring-buffer caveat, set by analyze_with_context.
+        note: Option<String>,
+    },
     #[default]
     Empty,
 }

@@ -28,7 +28,17 @@ const FIELDS: [&str; 10] = [
 pub fn scan(root: &Path) -> Vec<Signal> {
     let files: Vec<PathBuf> = if root.is_file() {
         let name = root.file_name().unwrap_or_default().to_string_lossy();
-        if name.to_ascii_lowercase() == "crashcontext.runtime-xml" {
+        // Keep the canonical UE filename (it ends in .runtime-xml, not .xml),
+        // and accept any dropped .xml that actually contains CrashContext.
+        let canonical = name.eq_ignore_ascii_case("crashcontext.runtime-xml");
+        let is_xml = root
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"));
+        let has_crash_context = is_xml
+            && fs::read_to_string(root)
+                .map(|text| text.to_ascii_lowercase().contains("<crashcontext"))
+                .unwrap_or(false);
+        if canonical || has_crash_context {
             vec![root.to_path_buf()]
         } else {
             Vec::new()
@@ -36,10 +46,7 @@ pub fn scan(root: &Path) -> Vec<Signal> {
     } else {
         let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in WalkDir::new(root).max_depth(9).into_iter().flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .to_ascii_lowercase()
+            if entry.file_name().to_string_lossy().to_ascii_lowercase()
                 != "crashcontext.runtime-xml"
             {
                 continue;
@@ -64,7 +71,10 @@ fn parse(path: &Path) -> Option<Signal> {
     let map = read_tags(&text);
     let time = ["time", "crashtime", "timestamp"]
         .iter()
-        .find_map(|key| map.get(*key).and_then(|value| crate::model::parse_timestamp(value)))
+        .find_map(|key| {
+            map.get(*key)
+                .and_then(|value| crate::model::parse_timestamp(value))
+        })
         .or(mtime)?;
 
     let mut signal = Signal::new("ue_xml", time);
@@ -90,13 +100,11 @@ fn parse(path: &Path) -> Option<Signal> {
     Some(signal)
 }
 
-/// HashMap iteration order changes between runs; build detail in a fixed
-/// order so evidence lines are byte-for-byte reproducible.
+/// Only the diagnostic whitelist reaches evidence/report. Unknown UE tags
+/// (EpicAccountId, LoginId, SteamID64, machine GUIDs, ...) are never copied.
 fn detail_from_map(map: &HashMap<String, String>) -> String {
     let mut keys: Vec<String> = FIELDS.iter().map(|key| key.to_ascii_lowercase()).collect();
-    for extra in ["time", "crashtime", "timestamp", "callstack"] {
-        keys.push(extra.to_owned());
-    }
+    keys.push("callstack".to_owned());
 
     let mut out = String::new();
     for key in &keys {
@@ -106,19 +114,6 @@ fn detail_from_map(map: &HashMap<String, String>) -> String {
             out.push_str(value);
             out.push('\n');
         }
-    }
-
-    // Unknown tags are still kept, but sorted rather than hash-ordered.
-    let mut rest: Vec<(&String, &String)> = map
-        .iter()
-        .filter(|(key, _)| !keys.contains(key))
-        .collect();
-    rest.sort_by(|a, b| a.0.cmp(b.0));
-    for (key, value) in rest {
-        out.push_str(key);
-        out.push('=');
-        out.push_str(value);
-        out.push('\n');
     }
     out
 }
@@ -162,10 +157,11 @@ mod tests {
         map.insert("bisoom".to_owned(), "true".to_owned());
         map.insert("zzz_extra".to_owned(), "last".to_owned());
         map.insert("aaa_extra".to_owned(), "first".to_owned());
+        map.insert("epicaccountid".to_owned(), "deadbeef".to_owned());
 
         assert_eq!(
             detail_from_map(&map),
-            "gamename=Game\nbisoom=true\nerrormessage=boom\naaa_extra=first\nzzz_extra=last\n"
+            "gamename=Game\nbisoom=true\nerrormessage=boom\n"
         );
     }
 }

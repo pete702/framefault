@@ -1,6 +1,7 @@
 use crate::model::SystemContext;
 
-const GPU_CLASS: &str = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+const GPU_CLASS: &str =
+    r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
 const MEMORY_MGMT: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
 const GRAPHICS: &str = r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers";
 const DWM: &str = r"SOFTWARE\Microsoft\Windows\Dwm";
@@ -48,13 +49,13 @@ pub fn read_context() -> SystemContext {
     // driver version belongs to the same adapter, not to index 0000.
     let mut gpu = dxgi_gpu_name().unwrap_or_default();
     let mut adapters: Vec<(String, String)> = Vec::new();
-    for index in 0..4 {
+    for index in 0..16 {
         let path = format!("{GPU_CLASS}\\{index:04}");
         let name = read_string_win(HKEY_LOCAL_MACHINE, &path, "DriverDesc")
             .or_else(|| read_string_win(HKEY_LOCAL_MACHINE, &path, "DeviceDescription"))
             .unwrap_or_default();
-        let version = read_string_win(HKEY_LOCAL_MACHINE, &path, "DriverVersion")
-            .unwrap_or_default();
+        let version =
+            read_string_win(HKEY_LOCAL_MACHINE, &path, "DriverVersion").unwrap_or_default();
         if !name.is_empty() || !version.is_empty() {
             adapters.push((name, version));
         }
@@ -75,7 +76,11 @@ pub fn read_context() -> SystemContext {
         })
         .unwrap_or("")
         .to_owned();
-    ctx.gpu = if gpu.is_empty() { "GPU: unknown".to_owned() } else { gpu };
+    ctx.gpu = if gpu.is_empty() {
+        "GPU: unknown".to_owned()
+    } else {
+        gpu
+    };
     ctx.driver = if driver.is_empty() {
         "driver: unknown".to_owned()
     } else {
@@ -97,8 +102,7 @@ pub fn read_context() -> SystemContext {
 
     let product = read_string_win(HKEY_LOCAL_MACHINE, NT_CURRENT, "ProductName")
         .unwrap_or_else(|| "Windows".to_owned());
-    let build = read_string_win(HKEY_LOCAL_MACHINE, NT_CURRENT, "CurrentBuild")
-        .unwrap_or_default();
+    let build = read_string_win(HKEY_LOCAL_MACHINE, NT_CURRENT, "CurrentBuild").unwrap_or_default();
     ctx.windows = format!("{} (build {})", product_name(&product, &build), build);
 
     let cpu = read_string_win(HKEY_LOCAL_MACHINE, CPU_PATH, "ProcessorNameString")
@@ -140,22 +144,16 @@ fn read_reg_bytes(
     value_name: &str,
 ) -> Option<Vec<u8>> {
     use windows::core::PCWSTR;
-    use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_READ,
+    };
 
     let wide_path = windows::core::HSTRING::from(path);
     let wide_name = windows::core::HSTRING::from(value_name);
     let mut key: HKEY = HKEY::default();
 
     unsafe {
-        if RegOpenKeyExW(
-            hive,
-            PCWSTR(wide_path.as_ptr()),
-            None,
-            KEY_READ,
-            &mut key,
-        )
-        .is_err()
-        {
+        if RegOpenKeyExW(hive, PCWSTR(wide_path.as_ptr()), None, KEY_READ, &mut key).is_err() {
             return None;
         }
         let mut len = 0u32;
@@ -227,12 +225,13 @@ fn driver_for_gpu<'a>(gpu: &str, adapters: &'a [(String, String)]) -> Option<&'a
     let needle = wanted.to_ascii_lowercase();
     adapters
         .iter()
-        .find(|(name, version)| {
+        .filter(|(name, version)| {
             let known = name.trim().to_ascii_lowercase();
             !version.is_empty()
                 && !known.is_empty()
                 && (known.contains(&needle) || needle.contains(&known))
         })
+        .max_by_key(|(name, _)| name.trim().chars().count())
         .map(|(_, version)| version.as_str())
 }
 
@@ -382,7 +381,11 @@ fn dxgi_gpu_name() -> Option<String> {
                 }
             }
         }
-        if best.1.is_empty() { None } else { Some(best.1) }
+        if best.1.is_empty() {
+            None
+        } else {
+            Some(best.1)
+        }
     }
 }
 
@@ -391,7 +394,7 @@ fn dxgi_gpu_name() -> Option<String> {
     None
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn human_pagefile(values: &[String]) -> String {
     let Some(first) = values.first() else {
         return "unknown".to_owned();
@@ -404,15 +407,22 @@ fn human_pagefile(values: &[String]) -> String {
         .collect::<String>()
         .trim_end_matches(':')
         .to_owned();
-    let mb = parts
+    let min_mb = parts
         .get(1)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let gib = mb as f64 / 1024.0;
-    if drive.is_empty() || gib == 0.0 {
+    let max_mb = parts
+        .get(2)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let min_gib = min_mb as f64 / 1024.0;
+    let max_gib = max_mb as f64 / 1024.0;
+    if drive.is_empty() || (min_mb == 0 && max_mb == 0) {
         "system managed".to_owned()
+    } else if min_mb == max_mb {
+        format!("{min_gib:.1} GiB fixed ({drive}:)")
     } else {
-        format!("{gib:.1} GiB ({drive}:)")
+        format!("{min_gib:.1}-{max_gib:.1} GiB ({drive}:)")
     }
 }
 
@@ -541,6 +551,28 @@ mod tests {
         );
         assert_eq!(driver_for_gpu("AMD Radeon Graphics", &adapters), None);
         assert_eq!(driver_for_gpu("", &adapters), None);
+
+        let similar = vec![
+            ("NVIDIA GeForce RTX 4070".to_owned(), "short".to_owned()),
+            ("NVIDIA GeForce RTX 4070 Ti".to_owned(), "long".to_owned()),
+        ];
+        assert_eq!(
+            driver_for_gpu("NVIDIA GeForce RTX 4070 Ti Super", &similar),
+            Some("long"),
+            "imprecise matching must pick the longest adapter name"
+        );
+    }
+
+    #[test]
+    fn pagefile_size_is_rendered_as_fixed_or_range() {
+        let fixed = vec![r"E:\pagefile.sys 2048 2048".to_owned()];
+        assert_eq!(human_pagefile(&fixed), "2.0 GiB fixed (E:)");
+
+        let dynamic = vec![r"E:\pagefile.sys 2048 16384".to_owned()];
+        assert_eq!(human_pagefile(&dynamic), "2.0-16.0 GiB (E:)");
+
+        let managed = vec![r"E:\pagefile.sys 0 0".to_owned()];
+        assert_eq!(human_pagefile(&managed), "system managed");
     }
 
     #[test]
@@ -556,11 +588,17 @@ mod tests {
         assert_eq!(pagefile_targets(&fixed), vec!["C:".to_owned()]);
 
         let dynamic = vec![r"E:\pagefile.sys 2048 16384".to_owned()];
-        assert_eq!(pagefile_targets(&dynamic), vec!["C:".to_owned(), "E:".to_owned()]);
+        assert_eq!(
+            pagefile_targets(&dynamic),
+            vec!["C:".to_owned(), "E:".to_owned()]
+        );
 
         // System managed on an explicit drive can still grow.
         let managed = vec![r"E:\pagefile.sys 0 0".to_owned()];
-        assert_eq!(pagefile_targets(&managed), vec!["C:".to_owned(), "E:".to_owned()]);
+        assert_eq!(
+            pagefile_targets(&managed),
+            vec!["C:".to_owned(), "E:".to_owned()]
+        );
 
         // Windows' "?:\\pagefile.sys" has no drive to check.
         let anywhere = vec![r"?:\pagefile.sys 0 0".to_owned()];

@@ -4,8 +4,11 @@
 
 pub fn redact(input: &str) -> String {
     let mut out = input.to_string();
+    out = mask_file_urls(&out);
     out = mask_profile_paths(&out);
+    out = mask_emails(&out);
     out = mask_guid(&out);
+    out = mask_hex_ids(&out);
     out = mask_sid(&out);
     out = mask_ipv6(&out);
     out = mask_ipv4(&out);
@@ -50,13 +53,26 @@ fn mask_env_secret(input: &str, var: &str, replacement: &str) -> String {
     out
 }
 
+fn find_ascii_ci(haystack: &str, needle: &str, from: usize) -> Option<usize> {
+    let slice = haystack.get(from..)?;
+    slice
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+        .map(|offset| from + offset)
+}
+
 fn mask_profile_paths(input: &str) -> String {
     let mut out = mask_unc_servers(input);
-    // Any drive letter, forward or back slashes: C:\Users\<name>, D:/Users/<name>, ...
-    for marker in ["\\Users\\", "/Users/"] {
+    // Windows is case-insensitive: C:\users\alice must be masked too.
+    for marker in [
+        "\\Users\\",
+        "/Users/",
+        "\\Documents and Settings\\",
+        "/Documents and Settings/",
+    ] {
         let mut cursor = 0usize;
-        while let Some(relative) = out[cursor..].find(marker) {
-            let name_start = cursor + relative + marker.len();
+        while let Some(relative) = find_ascii_ci(&out, marker, cursor) {
+            let name_start = relative + marker.len();
             let end = out[name_start..]
                 .find(['\\', '/'])
                 .map(|offset| name_start + offset)
@@ -64,6 +80,111 @@ fn mask_profile_paths(input: &str) -> String {
             out.replace_range(name_start..end, "%USERPROFILE%");
             cursor = name_start + "%USERPROFILE%".len();
         }
+    }
+    out
+}
+
+fn is_path_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '|')
+}
+
+fn mask_file_urls(input: &str) -> String {
+    const REPLACEMENT: &str = "[REDACTED-FILE-URL]";
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("file://") {
+        let start = cursor + relative;
+        out.push_str(&input[cursor..start]);
+        let body_start = start + "file://".len();
+        let end = input[body_start..]
+            .find(is_path_delimiter)
+            .map(|offset| body_start + offset)
+            .unwrap_or(input.len());
+        out.push_str(REPLACEMENT);
+        cursor = end;
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
+fn is_email_local_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
+}
+
+fn mask_emails(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if is_email_local_char(chars[i]) {
+            let start = i;
+            while i < chars.len() && is_email_local_char(chars[i]) {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '@' {
+                let mut end = i + 1;
+                while end < chars.len()
+                    && (chars[end].is_ascii_alphanumeric() || matches!(chars[end], '.' | '-'))
+                {
+                    end += 1;
+                }
+                let domain: String = chars[i + 1..end].iter().collect();
+                let valid = domain.contains('.')
+                    && !domain.starts_with('.')
+                    && !domain.ends_with('.')
+                    && domain.chars().any(|c| c.is_ascii_alphabetic());
+                if valid {
+                    out.push_str("[REDACTED-EMAIL]");
+                    i = end;
+                    continue;
+                }
+            }
+            out.extend(chars[start..i].iter());
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn preceded_by_name(chars: &[char], start: usize, key: &str) -> bool {
+    let key_chars: Vec<char> = key.chars().collect();
+    start >= key_chars.len()
+        && chars[start - key_chars.len()..start]
+            .iter()
+            .collect::<String>()
+            .eq_ignore_ascii_case(key)
+}
+
+/// 32-char hex IDs (EpicAccountId/MachineId style), but never `0x` offsets,
+/// ProcessCreationTime, or dotted version values.
+fn mask_hex_ids(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            let boundary_before = start == 0 || !chars[start - 1].is_ascii_alphanumeric();
+            let boundary_after = i == chars.len() || !chars[i].is_ascii_alphanumeric();
+            let hex_prefix =
+                start >= 2 && chars[start - 2] == '0' && matches!(chars[start - 1], 'x' | 'X');
+            let ignored_key = preceded_by_name(&chars, start, "FaultingOffset=")
+                || preceded_by_name(&chars, start, "ProcessCreationTime=");
+            if i - start == 32 && boundary_before && boundary_after && !hex_prefix && !ignored_key {
+                out.push_str("[REDACTED-ID]");
+            } else {
+                out.extend(chars[start..i].iter());
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
     }
     out
 }
@@ -84,13 +205,14 @@ fn mask_unc_servers(input: &str) -> String {
                 continue;
             }
             let body_start = start + marker.len();
-            let end = out[body_start..]
-                .find(|c: char| {
-                    c.is_whitespace()
-                        || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '|')
-                })
+            let mut end = out[body_start..]
+                .find(is_path_delimiter)
                 .map(|offset| body_start + offset)
                 .unwrap_or(out.len());
+            // Keep a sentence-final period outside the redaction marker.
+            while end > body_start && out.as_bytes()[end - 1] == b'.' {
+                end -= 1;
+            }
             out.replace_range(start..end, REPLACEMENT);
             cursor = start + REPLACEMENT.len();
         }
@@ -318,9 +440,8 @@ mod tests {
 
     #[test]
     fn every_unc_path_is_masked_but_urls_and_times_are_untouched() {
-        let out = redact(
-            r"\\nas01\profiles\alice\crash.log and \\other\share\bob\dump.dmp at 17:17:46",
-        );
+        let out =
+            redact(r"\\nas01\profiles\alice\crash.log and \\other\share\bob\dump.dmp at 17:17:46");
         assert_eq!(out.matches("[REDACTED-UNC]").count(), 2, "{out}");
         for leaked in ["nas01", "alice", "other", "share", "bob", "dump.dmp"] {
             assert!(!out.contains(leaked), "{leaked} leaked: {out}");
@@ -333,9 +454,8 @@ mod tests {
 
     #[test]
     fn ipv6_addresses_are_masked_without_breaking_times_or_windows_paths() {
-        let out = redact(
-            "client fe80::1%eth0 fd00::1234 ::1 2001:0db8:85a3:0000:0000:8a2e:0370:7334",
-        );
+        let out =
+            redact("client fe80::1%eth0 fd00::1234 ::1 2001:0db8:85a3:0000:0000:8a2e:0370:7334");
         assert_eq!(out.matches("[REDACTED-IPV6]").count(), 4, "{out}");
         for leaked in ["fe80", "fd00", "2001", "0db8", "0370"] {
             assert!(!out.contains(leaked), "{leaked} leaked: {out}");
@@ -349,7 +469,10 @@ mod tests {
     #[test]
     fn keeps_hardware_facts() {
         let out = redact("AppVersion=2026.4.0.0 ModuleVersion=10.0.26100.10068");
-        assert!(!out.contains("[REDACTED-IP]"), "versions must stay readable: {out}");
+        assert!(
+            !out.contains("[REDACTED-IP]"),
+            "versions must stay readable: {out}"
+        );
         let out = redact("GPU NVIDIA 32.0.15.6094 | RAM 32 GB | MPO 5 | RTSSHooks64.dll");
         assert!(out.contains("RTSSHooks64.dll"));
         assert!(out.contains("32.0.15.6094"));
@@ -364,7 +487,49 @@ mod tests {
         assert_eq!(out, versions, "version quads must survive verbatim: {out}");
 
         let out = redact("client ip 192.168.1.20");
-        assert!(out.contains("[REDACTED-IP]"), "real IPs must still be masked: {out}");
+        assert!(
+            out.contains("[REDACTED-IP]"),
+            "real IPs must still be masked: {out}"
+        );
+    }
+
+    #[test]
+    fn profile_paths_are_case_insensitive_and_documents_is_masked() {
+        let out = redact(r"C:\users\alice\AppData\Local\file.txt");
+        assert!(!out.contains("alice"), "{out}");
+        assert!(out.contains("%USERPROFILE%"), "{out}");
+
+        let out = redact(r"D:\Documents and Settings\bob\ntuser.dat");
+        assert!(!out.contains("bob"), "{out}");
+        assert!(out.contains("%USERPROFILE%"), "{out}");
+    }
+
+    #[test]
+    fn emails_file_urls_and_hex_ids_are_masked() {
+        let out = redact("contact alice@example.com");
+        assert!(out.contains("[REDACTED-EMAIL]"), "{out}");
+        assert!(!out.contains("alice"), "{out}");
+        assert!(!out.contains("example.com"), "{out}");
+
+        let out = redact("file:///C:/Users/alice/crash.dmp");
+        assert!(out.contains("[REDACTED-FILE-URL]"), "{out}");
+        assert!(!out.contains("alice"), "{out}");
+
+        let out = redact("EpicAccountId deadbeefcafebabe0011223344556677");
+        assert!(out.contains("[REDACTED-ID]"), "{out}");
+        assert!(!out.contains("deadbeef"), "{out}");
+
+        let offset = "FaultingOffset=deadbeefcafebabe0011223344556677";
+        assert_eq!(redact(offset), offset);
+        let created = "ProcessCreationTime=20261120101112000000000000000000";
+        assert_eq!(redact(created), created);
+    }
+
+    #[test]
+    fn unc_trailing_period_stays_outside_the_marker() {
+        assert_eq!(redact(r"\\srv\share\file.log."), "[REDACTED-UNC].");
+        assert_eq!(redact(r"\\srv\share\file.log,"), "[REDACTED-UNC],");
+        assert_eq!(redact(r"\\srv\share\file.log;"), "[REDACTED-UNC];");
     }
 
     #[test]
@@ -375,7 +540,10 @@ mod tests {
         ] {
             let out = redact(url);
             assert_eq!(out, url, "URL must stay intact: {out}");
-            assert!(!out.contains("[REDACTED-UNC]"), "URL must not be masked: {out}");
+            assert!(
+                !out.contains("[REDACTED-UNC]"),
+                "URL must not be masked: {out}"
+            );
         }
 
         let out = redact(r"\\NAS\share\user");

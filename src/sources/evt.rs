@@ -29,7 +29,7 @@ pub fn excerpt(text: &str, max: usize) -> String {
 pub fn read_recent() -> Vec<Signal> {
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::System::EventLog::{
-        EvtClose, EvtNext, EvtQuery, EvtQueryReverseDirection, EVT_HANDLE,
+        EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryReverseDirection, EVT_HANDLE,
     };
 
     let xpath = format!("*[System[{IDS}]]");
@@ -43,7 +43,7 @@ pub fn read_recent() -> Vec<Signal> {
                 None,
                 PCWSTR(channel_name.as_ptr()),
                 PCWSTR(query.as_ptr()),
-                EvtQueryReverseDirection.0,
+                EvtQueryChannelPath.0 | EvtQueryReverseDirection.0,
             ) {
                 Ok(handle) => handle,
                 Err(_) => continue,
@@ -114,8 +114,9 @@ pub fn log_reach() -> String {
             EvtClose, EvtNext, EvtQuery, EvtQueryChannelPath, EvtQueryForwardDirection, EVT_HANDLE,
         };
 
-        let xpath = format!("*[System[{IDS}]]");
-        let query = HSTRING::from(xpath.as_str());
+        // The whole channel, no crash-ID filter: this is the real ring-buffer
+        // depth, not the oldest matching crash event.
+        let query = HSTRING::from("*");
         let mut parts = Vec::new();
         for channel in ["System", "Application"] {
             let name = HSTRING::from(channel);
@@ -246,7 +247,7 @@ fn attribute(xml: &str, start: &str, key: &str) -> Option<String> {
 fn tag_value(xml: &str, tag: &str) -> Option<String> {
     let from = xml.find(tag)? + tag.len();
     let rest = &xml[from..];
-    let gt = rest.find('>')? + 1;
+    let gt = find_tag_end(rest)? + 1;
     let end = rest[gt..].find("</")? + gt;
     Some(rest[gt..end].trim().to_owned())
 }
@@ -259,13 +260,17 @@ fn parse_xml(text: &str, channel: &str) -> Vec<Signal> {
         let end = positions.get(index + 1).copied().unwrap_or(text.len());
         let chunk = &text[*start..end];
 
-        let provider = attribute(chunk, "<Provider ", "Name=")
-            .unwrap_or_else(|| "Unknown".to_owned());
+        let provider =
+            attribute(chunk, "<Provider ", "Name=").unwrap_or_else(|| "Unknown".to_owned());
         let event_id = tag_value(chunk, "<EventID")
             .and_then(|value| value.trim_start_matches('>').parse::<u16>().ok());
-        let time = attribute(chunk, "<TimeCreated ", "SystemTime=")
-            .and_then(|value| parse_time(&value))
-            .unwrap_or_else(Local::now);
+        // A missing or malformed TimeCreated must not create a fake "now"
+        // anchor: drop the event instead.
+        let Some(time) =
+            attribute(chunk, "<TimeCreated ", "SystemTime=").and_then(|value| parse_time(&value))
+        else {
+            continue;
+        };
 
         let mut signal = Signal::new("eventlog", time);
         signal.provider = provider;
@@ -277,8 +282,17 @@ fn parse_xml(text: &str, channel: &str) -> Vec<Signal> {
         let mut detail = String::new();
         for (data_index, (offset, _)) in chunk.match_indices("<Data").enumerate() {
             let rest = &chunk[offset..];
-            let Some(gt) = find_tag_end(rest) else { continue };
-            let Some(close) = rest[gt + 1..].find("</Data>") else { continue };
+            let Some(gt) = find_tag_end(rest) else {
+                continue;
+            };
+            // <Data Name="A" /> is empty and self-closing; never search for a
+            // </Data> belonging to the following element.
+            if rest[..gt].trim_end().ends_with('/') {
+                continue;
+            }
+            let Some(close) = rest[gt + 1..].find("</Data>") else {
+                continue;
+            };
             let value = rest[gt + 1..gt + 1 + close].trim().to_owned();
             if value.is_empty() {
                 continue;
@@ -374,7 +388,12 @@ impl Builder {
 }
 
 fn parse_time(value: &str) -> Option<DateTime<Local>> {
-    let value = value.trim_end_matches('Z');
+    let value = value.trim();
+    // Event XML stores UTC (`...Z`); an offset is also valid RFC3339.
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Local));
+    }
+    // Older/captured text logs may omit the timezone; treat those as local.
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").ok()?;
     Local.from_local_datetime(&naive).single()
 }
@@ -434,13 +453,91 @@ mod tests {
         let signals = parse_xml(xml, "Application");
         assert_eq!(signals.len(), 1);
         let signal = &signals[0];
-        assert_eq!(signal.provider, "Game > Test", "provider: {}", signal.provider);
+        assert_eq!(
+            signal.provider, "Game > Test",
+            "provider: {}",
+            signal.provider
+        );
         assert_eq!(signal.get("Side > Info"), Some("value"));
         assert!(
             signal.detail.contains("Side > Info=value"),
             "detail: {}",
             signal.detail
         );
+    }
+
+    #[test]
+    fn utc_system_time_is_converted_to_local() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="TestProvider" />
+<EventID>1000</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData>
+<Data Name="FaultingApplicationName">Game.exe</Data>
+</EventData>
+</Event>"#;
+        let signals = parse_xml(xml, "Application");
+        assert_eq!(signals.len(), 1);
+        let expected = DateTime::parse_from_rfc3339("2026-11-20T10:11:12.0000000Z")
+            .expect("fixture timestamp")
+            .with_timezone(&Local);
+        assert_eq!(
+            signals[0].t, expected,
+            "UTC SystemTime must be converted to Local, not treated as local"
+        );
+    }
+
+    #[test]
+    fn self_closing_data_does_not_swallow_the_next_field() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="TestProvider" />
+<EventID>1000</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData>
+<Data Name="A" />
+<Data Name="B">val</Data>
+</EventData>
+</Event>"#;
+        let signals = parse_xml(xml, "Application");
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].get("A"), None);
+        assert_eq!(signals[0].get("B"), Some("val"));
+        assert!(
+            !signals[0].detail.contains("<Data"),
+            "detail swallowed markup: {}",
+            signals[0].detail
+        );
+    }
+
+    #[test]
+    fn event_id_attributes_may_contain_a_raw_greater_than() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="TestProvider" />
+<EventID Qualifiers="a>b">4101</EventID>
+<TimeCreated SystemTime="2026-11-20T10:11:12.0000000Z" />
+</System>
+<EventData />
+</Event>"#;
+        let signals = parse_xml(xml, "System");
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].event_id, Some(4101));
+    }
+
+    #[test]
+    fn event_without_a_time_created_is_skipped() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+<System>
+<Provider Name="TestProvider" />
+<EventID>1000</EventID>
+</System>
+<EventData />
+</Event>"#;
+        assert!(parse_xml(xml, "Application").is_empty());
     }
 
     #[test]

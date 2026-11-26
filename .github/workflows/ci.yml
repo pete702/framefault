@@ -19,19 +19,25 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
+      - name: Format check
+        run: cargo fmt --check
+
       - name: Clippy (all features, incl. cli)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Test (all features, incl. cli)
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
+
+      - name: CLI self-test smoke
+        run: cargo run --locked --features cli -- --self_test
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release
 
   # Decides whether this push should publish a release.
   # main push: only when Cargo.toml version has no release yet.
@@ -67,6 +73,10 @@ jobs:
               exit 1
             fi
           fi
+          if ! grep -qF "## $version" CHANGELOG.md && ! grep -qF "## [$version]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section for version $version"
+            exit 1
+          fi
           if gh release view "v$version" >/dev/null 2>&1; then
             if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
               build=true
@@ -97,7 +107,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Prepare archive
         shell: bash
@@ -119,9 +129,9 @@ jobs:
         shell: bash
         run: |
           section=$(mktemp)
-          awk -v header="## ${VERSION}" '
-            index($0, header) == 1 { found = 1; next }
-            found && index($0, "## ") == 1 { exit }
+          awk -v version="${VERSION}" '
+            $0 == "## " version || $0 == "## [" version "]" { found = 1; next }
+            found && /^## / { exit }
             found { print }
           ' CHANGELOG.md > "$section" 2>/dev/null || true
           {

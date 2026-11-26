@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -22,12 +22,7 @@ pub enum IncidentFilter {
 }
 
 fn app_key(title: &str) -> String {
-    title
-        .split(" - ")
-        .next()
-        .unwrap_or(title)
-        .trim()
-        .to_owned()
+    title.split(" - ").next().unwrap_or(title).trim().to_owned()
 }
 
 fn short_cpu(cpu: &str) -> String {
@@ -47,10 +42,10 @@ const HARDWARE_MARKERS: &[&str] = &[
     "kernel-power",
     "kernel power",
     "resource-exhaustion",
+    "resource-exhaustion-detector",
     "low virtual memory",
     "livekernelevent",
     "live kernel event",
-    "2004",
 ];
 
 fn matches_filter(filter: IncidentFilter, query: &str, inc: &Incident) -> bool {
@@ -75,21 +70,21 @@ pub struct App {
     ctx: SystemContext,
     analysis: Analysis,
     selected: usize,
-    days: i64,
+    /// `None` = All days; `Some(n)` = last n days.
+    days: Option<i64>,
     path: Option<PathBuf>,
     /// Raw drop slot from egui; consumed once per frame.
     pending: Option<PathBuf>,
     /// A dropped path waiting for the next scan. Kept separate from `path`
     /// so a finishing scan cannot overwrite it with its own older root.
     pending_path: Option<PathBuf>,
-    last_scanned: Option<PathBuf>,
     status: String,
     logo: Option<TextureHandle>,
     copied: bool,
     scanning: bool,
     /// A day/Rescan click during a scan is replayed instead of dropped.
     rescan_queued: bool,
-    receiver: Option<Receiver<(Analysis, SystemContext, PathBuf)>>,
+    receiver: Option<Receiver<(Analysis, SystemContext)>>,
     hidden_apps: Vec<String>,
     filter: IncidentFilter,
     search_query: String,
@@ -97,8 +92,16 @@ pub struct App {
 
 fn install_system_fonts(ctx: &egui::Context) {
     let candidates: [(&str, &str, FontFamily); 2] = [
-        ("SegoeUI", r"C:\Windows\Fonts\segoeui.ttf", FontFamily::Proportional),
-        ("Consolas", r"C:\Windows\Fonts\consola.ttf", FontFamily::Monospace),
+        (
+            "SegoeUI",
+            r"C:\Windows\Fonts\segoeui.ttf",
+            FontFamily::Proportional,
+        ),
+        (
+            "Consolas",
+            r"C:\Windows\Fonts\consola.ttf",
+            FontFamily::Monospace,
+        ),
     ];
     for (name, path, family) in candidates {
         if let Ok(bytes) = std::fs::read(path) {
@@ -121,9 +124,9 @@ impl App {
             [32, 32],
             include_bytes!("../assets/icon.rgba"),
         );
-        let logo = cc
-            .egui_ctx
-            .load_texture("framefault-logo", image, egui::TextureOptions::NEAREST);
+        let logo =
+            cc.egui_ctx
+                .load_texture("framefault-logo", image, egui::TextureOptions::NEAREST);
 
         let mut app = Self {
             // Real context arrives from the background scan; no registry/Event
@@ -131,7 +134,7 @@ impl App {
             ctx: SystemContext::default(),
             analysis: Analysis::Empty,
             selected: 0,
-            days: 7,
+            days: Some(7),
             path: None,
             pending: None,
             pending_path: None,
@@ -144,7 +147,6 @@ impl App {
             hidden_apps: Vec::new(),
             filter: IncidentFilter::default(),
             search_query: String::new(),
-            last_scanned: None,
         };
         app.start_scan();
         app
@@ -177,27 +179,23 @@ impl App {
         std::thread::spawn(move || {
             let ctx = crate::context();
             let analysis = crate::analyze_with_context(&root, &ctx);
-            let _ = tx.send((analysis, ctx, root));
+            let _ = tx.send((analysis, ctx));
         });
     }
 
-    fn finish_scan(&mut self, analysis: Analysis, ctx: SystemContext, root: PathBuf) {
+    fn finish_scan(&mut self, analysis: Analysis, ctx: SystemContext) {
         let queued = self.rescan_queued;
         self.rescan_queued = false;
-        let mut analysis = analysis;
-        if let Analysis::Results { incidents, .. } = &mut analysis {
-            let cutoff = Local::now() - Duration::days(self.days);
-            incidents.retain(|incident| incident.time >= cutoff);
-        }
-        // `self.path` already points at the root of the currently displayed
-        // scan; overwriting it here would destroy a path dropped mid-scan.
-        self.last_scanned = Some(root);
         self.ctx = ctx;
         self.analysis = analysis;
         self.selected = 0;
+        self.copied = false;
         self.scanning = false;
-        let count = self.visible_incidents().len();
-        self.status = format!("Scanned {count} incident(s) | {}", Local::now().format("%H:%M:%S"));
+        let count = self.total_incidents();
+        self.status = format!(
+            "Scanned {count} incident(s) | {}",
+            Local::now().format("%H:%M:%S")
+        );
         if queued {
             self.start_scan();
         }
@@ -221,11 +219,26 @@ impl App {
         matches_filter(self.filter, &self.search_query, inc)
     }
 
+    fn total_incidents(&self) -> usize {
+        match &self.analysis {
+            Analysis::Results { incidents, .. } => incidents.len(),
+            _ => 0,
+        }
+    }
+
+    fn incident_in_period(&self, incident: &Incident) -> bool {
+        match self.days {
+            None => true,
+            Some(days) => incident.time >= Local::now() - Duration::days(days),
+        }
+    }
+
     fn visible_incidents(&self) -> Vec<crate::model::Incident> {
         match &self.analysis {
             Analysis::Results { incidents, .. } => incidents
                 .iter()
                 .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
+                .filter(|incident| self.incident_in_period(incident))
                 .filter(|incident| self.matches_filter(incident))
                 .cloned()
                 .collect(),
@@ -233,21 +246,64 @@ impl App {
         }
     }
 
+    fn older_incidents_count(&self) -> usize {
+        let Some(days) = self.days else {
+            return 0;
+        };
+        let cutoff = Local::now() - Duration::days(days);
+        match &self.analysis {
+            Analysis::Results { incidents, .. } => incidents
+                .iter()
+                .filter(|incident| incident.time < cutoff)
+                .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
+                .filter(|incident| self.matches_filter(incident))
+                .count(),
+            _ => 0,
+        }
+    }
+
+    fn empty_incidents_message(&self) -> String {
+        if self.total_incidents() == 0 {
+            return "No incidents found in scanned logs.".to_owned();
+        }
+        let older = self.older_incidents_count();
+        if older > 0 {
+            return format!(
+                "No incidents in last {}d ({} older found - try 30d or All)",
+                self.days.unwrap_or(0),
+                older
+            );
+        }
+        "No incidents match the current filter/search.".to_owned()
+    }
+
+    fn current_note(&self) -> Option<&str> {
+        match &self.analysis {
+            Analysis::Results { note, .. } | Analysis::NoAnchor { note } => note.as_deref(),
+            Analysis::Empty => None,
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some(logo) = &self.logo {
-                ui.image(egui::load::SizedTexture::new(
-                    logo.id(),
-                    Vec2::splat(26.0),
-                ));
+                ui.image(egui::load::SizedTexture::new(logo.id(), Vec2::splat(26.0)));
             }
             ui.heading("FrameFault");
-            ui.label(RichText::new("one verdict per crash | read-only").small().weak());
+            ui.label(
+                RichText::new("one verdict per crash | read-only")
+                    .small()
+                    .weak(),
+            );
             ui.add_space(12.0);
 
             let overlays = self.ctx.overlays_now.clone();
             ui.menu_button("Overlays now", move |ui| {
-                ui.label(RichText::new("LIVE STATE - not crash time").small().italics());
+                ui.label(
+                    RichText::new("LIVE STATE - not crash time")
+                        .small()
+                        .italics(),
+                );
                 if overlays.is_empty() {
                     ui.label("none detected");
                 }
@@ -259,13 +315,16 @@ impl App {
             if ui.button("Rescan").clicked() {
                 self.start_scan();
             }
-            for days in [7, 14, 30] {
-                if ui
-                    .selectable_label(self.days == days, format!("{days}d"))
-                    .clicked()
-                {
+            for (days, label) in [
+                (Some(7), "7d"),
+                (Some(14), "14d"),
+                (Some(30), "30d"),
+                (None, "All"),
+            ] {
+                if ui.selectable_label(self.days == days, label).clicked() {
                     self.days = days;
-                    self.start_scan();
+                    self.selected = 0;
+                    self.copied = false;
                 }
             }
         });
@@ -275,14 +334,17 @@ impl App {
             ui.separator();
             ui.label(RichText::new(format!("CPU {}", short_cpu(&self.ctx.cpu))).small());
             ui.separator();
-            ui.label(RichText::new(format!(
-                "RAM {:.1}/{:.1} GiB | Commit {:.1}/{:.1} GiB | Pagefile {}",
-                self.ctx.ram_used_gib,
-                self.ctx.ram_total_gib,
-                self.ctx.commit_used_gib,
-                self.ctx.commit_limit_gib,
-                self.ctx.pagefile
-            )).small());
+            ui.label(
+                RichText::new(format!(
+                    "RAM {:.1}/{:.1} GiB | Commit {:.1}/{:.1} GiB | Pagefile {}",
+                    self.ctx.ram_used_gib,
+                    self.ctx.ram_total_gib,
+                    self.ctx.commit_used_gib,
+                    self.ctx.commit_limit_gib,
+                    self.ctx.pagefile
+                ))
+                .small(),
+            );
             ui.separator();
             ui.label(RichText::new(format!("MPO: {}", self.ctx.mpo)).small());
             ui.separator();
@@ -299,18 +361,18 @@ impl App {
                 warning_badge(ui, note, "Non-default TDR registry value (read-only).");
             }
             if let Some(warning) = &self.ctx.disk_warn {
-                warning_badge(
-                    ui,
-                    warning,
-                    "Low free space on C: or the pagefile drive.",
-                );
+                warning_badge(ui, warning, "Low free space on C: or the pagefile drive.");
             }
         });
     }
 
     fn incident_list(&mut self, ui: &mut egui::Ui) {
         ui.heading("Incidents");
-        ui.label(RichText::new(&self.ctx.log_reach).small().weak());
+        if let Some(note) = self.current_note() {
+            ui.label(RichText::new(note).small().weak());
+        } else {
+            ui.label(RichText::new(&self.ctx.log_reach).small().weak());
+        }
         ui.horizontal(|ui| {
             for (filter, label) in [
                 (IncidentFilter::All, "All"),
@@ -320,6 +382,7 @@ impl App {
                 if ui.selectable_label(self.filter == filter, label).clicked() {
                     self.filter = filter;
                     self.selected = 0;
+                    self.copied = false;
                 }
             }
         });
@@ -332,22 +395,28 @@ impl App {
         );
         if self.search_query != previous_query {
             self.selected = 0;
+            self.copied = false;
         }
         ui.separator();
 
         let incidents = self.visible_incidents();
         if !self.hidden_apps.is_empty() {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{} hidden", self.hidden_apps.len())).small().weak());
+                ui.label(
+                    RichText::new(format!("{} hidden", self.hidden_apps.len()))
+                        .small()
+                        .weak(),
+                );
                 if ui.small_button("Show all").clicked() {
                     self.hidden_apps.clear();
-                    self.start_scan();
+                    self.selected = 0;
+                    self.copied = false;
                 }
             });
         }
 
         if incidents.is_empty() {
-            ui.label("No incidents in the selected period.");
+            ui.label(self.empty_incidents_message());
         }
         for (index, incident) in incidents.iter().enumerate() {
             let verdict = incident
@@ -356,7 +425,11 @@ impl App {
                 .map(|finding| finding.verdict.as_str())
                 .unwrap_or("no verdict");
             let label = if verdict == incident.title {
-                format!("{}  {}", incident.time.format("%m-%d %H:%M:%S"), incident.title)
+                format!(
+                    "{}  {}",
+                    incident.time.format("%m-%d %H:%M:%S"),
+                    incident.title
+                )
             } else {
                 format!(
                     "{}  {}\n{}",
@@ -365,11 +438,15 @@ impl App {
                     verdict
                 )
             };
+            let was_selected = self.selected;
             if ui
                 .selectable_value(&mut self.selected, index, label)
                 .clicked()
             {
                 // selection is already applied by selectable_value
+            }
+            if self.selected != was_selected {
+                self.copied = false;
             }
         }
     }
@@ -381,20 +458,33 @@ impl App {
             return;
         }
         match &self.analysis {
-            Analysis::NoAnchor => {
+            Analysis::NoAnchor { note } => {
                 ui.heading("No crash anchor found");
-                ui.label("Drop a crash folder, Report.wer, CrashContext.runtime-xml or Player.log.");
+                ui.label(
+                    "Drop a crash folder, Report.wer, CrashContext.runtime-xml or Player.log.",
+                );
+                if let Some(note) = note {
+                    ui.label(RichText::new(note.as_str()).small().weak());
+                }
                 return;
             }
             Analysis::Empty => {
-                ui.label("Waiting for a crash artifact ...");
+                if self.path.is_some() {
+                    ui.heading("No incidents found in scanned logs");
+                } else {
+                    ui.label("Waiting for a crash artifact ...");
+                }
                 return;
             }
             Analysis::Results { .. } => {}
         }
 
         let incidents = self.visible_incidents();
-        if !incidents.is_empty() && self.selected >= incidents.len() {
+        if incidents.is_empty() {
+            ui.label(self.empty_incidents_message());
+            return;
+        }
+        if self.selected >= incidents.len() {
             self.selected = 0;
         }
         let Some(incident) = incidents.get(self.selected) else {
@@ -407,8 +497,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&incident.title).weak());
             if ui.small_button("Hide events from this app").clicked() {
-                self.hidden_apps.push(hide_key.clone());
+                if !self.hidden_apps.contains(&hide_key) {
+                    self.hidden_apps.push(hide_key.clone());
+                }
                 self.selected = 0;
+                self.copied = false;
             }
         });
         ui.add_space(8.0);
@@ -426,7 +519,11 @@ impl App {
                         _ => Color32::from_rgb(120, 170, 220),
                     },
                 );
-                ui.label(RichText::new(format!("score {}", finding.score)).small().weak());
+                ui.label(
+                    RichText::new(format!("score {}", finding.score))
+                        .small()
+                        .weak(),
+                );
             });
 
             let sources = finding.source_count.max(1);
@@ -496,6 +593,12 @@ impl App {
         ui.separator();
         ui.label(&self.status);
         ui.separator();
+        ui.label(format!(
+            "Showing {} / {} incident(s)",
+            self.visible_incidents().len(),
+            self.total_incidents()
+        ));
+        ui.separator();
         ui.hyperlink_to("GitHub", GITHUB_URL);
     }
 }
@@ -515,16 +618,24 @@ impl eframe::App for App {
             self.start_scan();
         }
 
-        let received = self
-            .receiver
-            .as_ref()
-            .and_then(|receiver| receiver.try_recv().ok());
-        if let Some((analysis, ctx, root)) = received {
-            self.receiver = None;
-            self.finish_scan(analysis, ctx, root);
+        let received = self.receiver.as_ref().map(|receiver| receiver.try_recv());
+        match received {
+            Some(Ok((analysis, ctx))) => {
+                self.receiver = None;
+                self.finish_scan(analysis, ctx);
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.receiver = None;
+                self.scanning = false;
+                self.pending_path = None;
+                self.rescan_queued = false;
+                self.status = "Scan failed: worker thread disconnected".to_owned();
+            }
+            Some(Err(TryRecvError::Empty)) | None => {}
         }
         if self.scanning {
-            ui.ctx().request_repaint_after(StdDuration::from_millis(120));
+            ui.ctx()
+                .request_repaint_after(StdDuration::from_millis(120));
         }
 
         egui::containers::Panel::top("header").show(ui, |ui| {
@@ -624,14 +735,10 @@ mod tests {
     #[test]
     fn gpu_marker_incident_passes_games_filter() {
         let mut incident = bsod_incident();
-        incident.findings[0].evidence.push(
-            "2026-11-25 10:00:05 | eventlog | nvlddmkm | GPUID=10de:1b06".to_owned(),
-        );
-        assert!(matches_filter(
-            IncidentFilter::GamesAndGpu,
-            "",
-            &incident
-        ));
+        incident.findings[0]
+            .evidence
+            .push("2026-11-25 10:00:05 | eventlog | nvlddmkm | GPUID=10de:1b06".to_owned());
+        assert!(matches_filter(IncidentFilter::GamesAndGpu, "", &incident));
     }
 
     fn idle_app() -> App {
@@ -639,11 +746,10 @@ mod tests {
             ctx: SystemContext::default(),
             analysis: Analysis::Empty,
             selected: 0,
-            days: 7,
+            days: Some(7),
             path: None,
             pending: None,
             pending_path: None,
-            last_scanned: None,
             status: String::new(),
             logo: None,
             copied: false,
@@ -670,11 +776,7 @@ mod tests {
 
         // Suppress the automatic replay so this unit test spawns no thread.
         app.rescan_queued = false;
-        app.finish_scan(
-            Analysis::Empty,
-            SystemContext::default(),
-            PathBuf::from("old-root"),
-        );
+        app.finish_scan(Analysis::Empty, SystemContext::default());
         assert_eq!(
             app.path,
             Some(PathBuf::from("old-root")),

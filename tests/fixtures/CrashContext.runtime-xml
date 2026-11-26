@@ -13,6 +13,8 @@
     <totalphysicalram>34359738368</totalphysicalram>
     <bisOOM>true</bisOOM>
     <errormessage>Fatal error: Out of video memory trying to allocate a rendering resource</errormessage>
+    <EpicAccountId>deadbeefcafebabe0011223344556677</EpicAccountId>
+    <LoginId>76561198000000000</LoginId>
     <CallStack></CallStack>
   </RuntimeProperties>
 </CrashContext>

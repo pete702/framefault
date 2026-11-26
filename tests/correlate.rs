@@ -62,7 +62,11 @@ fn utf16le_wer_is_decoded_and_modules_are_collected() {
 #[test]
 fn utf8_report_wer_fixture_is_parsed_without_system_module_noise() {
     let signals = framefault::sources::wer::scan(&fixtures().join("Report.wer"));
-    assert_eq!(signals.len(), 1, "UTF-8 Report.wer fixture must be readable");
+    assert_eq!(
+        signals.len(),
+        1,
+        "UTF-8 Report.wer fixture must be readable"
+    );
     let signal = &signals[0];
     assert_eq!(signal.provider, "WER");
     assert_eq!(signal.fields.get("Version").map(String::as_str), Some("1"));
@@ -127,6 +131,62 @@ fn ue5_lowercase_tags_and_empty_callstack_are_handled() {
 }
 
 #[test]
+fn ue_identity_tags_never_reach_detail() {
+    let signals = framefault::sources::ue::scan(&fixtures().join("CrashContext.runtime-xml"));
+    assert_eq!(signals.len(), 1);
+    let detail = signals[0].detail.to_ascii_lowercase();
+    assert!(
+        !detail.contains("epicaccountid"),
+        "detail: {}",
+        signals[0].detail
+    );
+    assert!(!detail.contains("7656119"), "detail: {}", signals[0].detail);
+    assert!(
+        detail.contains("errormessage="),
+        "detail: {}",
+        signals[0].detail
+    );
+}
+
+#[test]
+fn ue_is_ensure_without_bisoom_is_not_oom() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut ue = Signal::new("ue_xml", now);
+    ue.provider = "TestGame".to_owned();
+    ue.fields.insert("IsEnsure".to_owned(), "true".to_owned());
+    ue.detail = "isensure=true\n".to_owned();
+
+    let oom = ruleset
+        .rules
+        .iter()
+        .find(|rule| rule.id == "ue_oom_flag")
+        .expect("ue_oom_flag rule missing");
+    assert!(
+        !oom.matches(&ue),
+        "missing bIsOOM must not fall back to detail"
+    );
+
+    let analysis = framefault::correlate::run(&[ue], &ruleset);
+    let has_oom = match &analysis {
+        Analysis::Results { incidents, .. } => incidents
+            .iter()
+            .flat_map(|i| &i.findings)
+            .any(|f| f.verdict.contains("out-of-memory") || f.verdict.contains("out of memory")),
+        _ => false,
+    };
+    assert!(!has_oom, "unexpected OOM verdict: {analysis:#?}");
+}
+
+#[test]
+fn non_utf8_game_log_still_finds_markers() {
+    let signals = framefault::sources::gamelog::scan(&fixtures().join("Player-invalid.log"));
+    assert_eq!(signals.len(), 1);
+    assert!(signals[0].detail.contains("DXGI_ERROR_DEVICE_HUNG"));
+}
+
+#[test]
 fn unity_player_log_dxgi_error_produces_a_verdict() {
     let ruleset = framefault::rules::load();
     let signals = framefault::sources::gamelog::scan(&fixtures().join("Player.log"));
@@ -140,7 +200,10 @@ fn unity_player_log_dxgi_error_produces_a_verdict() {
         .iter()
         .find(|r| r.id == "dxgi_device_hung")
         .expect("dxgi_device_hung rule missing");
-    assert!(rule.matches(signal), "unity_log must be accepted via source_any");
+    assert!(
+        rule.matches(signal),
+        "unity_log must be accepted via source_any"
+    );
 
     let analysis = framefault::correlate::run(&signals, &ruleset);
     let Analysis::Results { incidents, .. } = &analysis else {
@@ -179,7 +242,9 @@ fn correlation_produces_distinct_verdicts_without_averaging() {
         "System",
     );
     signals.extend(framefault::sources::wer::scan(&f.join("Report-utf16.wer")));
-    signals.extend(framefault::sources::ue::scan(&f.join("CrashContext.runtime-xml")));
+    signals.extend(framefault::sources::ue::scan(
+        &f.join("CrashContext.runtime-xml"),
+    ));
     signals.extend(framefault::sources::gamelog::scan(&f.join("game.log")));
     signals.extend(framefault::sources::gamelog::scan(&f.join("Player.log")));
 
@@ -189,7 +254,11 @@ fn correlation_produces_distinct_verdicts_without_averaging() {
     }
 
     let ruleset = framefault::rules::load();
-    let nvidia_rule = ruleset.rules.iter().find(|r| r.id == "tdr_nvidia_153").unwrap();
+    let nvidia_rule = ruleset
+        .rules
+        .iter()
+        .find(|r| r.id == "tdr_nvidia_153")
+        .unwrap();
     let event = signals
         .iter()
         .find(|s| s.source == "eventlog" && s.event_id == Some(153))
@@ -230,7 +299,9 @@ fn correlation_produces_distinct_verdicts_without_averaging() {
         .map(|f| f.verdict.clone())
         .collect();
     assert!(
-        verdicts.iter().any(|v| v.contains("NVIDIA GPU driver timeout")),
+        verdicts
+            .iter()
+            .any(|v| v.contains("NVIDIA GPU driver timeout")),
         "verdicts: {verdicts:#?} evidence: {:#?}",
         incidents[0]
             .findings
@@ -245,25 +316,28 @@ fn correlation_produces_distinct_verdicts_without_averaging() {
 
 #[test]
 fn redaction_and_self_test_are_silent_about_identity() {
-    let report = framefault::report::markdown(&Analysis::Results {
-        incidents: vec![framefault::model::Incident {
-            title: "Game.exe".to_owned(),
-            time: Local::now(),
-            findings: vec![framefault::model::Finding {
-                verdict: "test".to_owned(),
-                score: 1,
-                confidence: "High".to_owned(),
-                source_count: 1,
-                evidence: vec![
-                    "C:\\Users\\alice\\saved\\ip 192.168.1.20 sid S-1-5-21-999".to_owned(),
-                ],
-                next_steps: Vec::new(),
-                link: None,
-                note: None,
+    let report = framefault::report::markdown_with_context(
+        &Analysis::Results {
+            incidents: vec![framefault::model::Incident {
+                title: "Game.exe".to_owned(),
+                time: Local::now(),
+                findings: vec![framefault::model::Finding {
+                    verdict: "test".to_owned(),
+                    score: 1,
+                    confidence: "High".to_owned(),
+                    source_count: 1,
+                    evidence: vec![
+                        "C:\\Users\\alice\\saved\\ip 192.168.1.20 sid S-1-5-21-999".to_owned()
+                    ],
+                    next_steps: Vec::new(),
+                    link: None,
+                    note: None,
+                }],
             }],
-        }],
-        note: None,
-    });
+            note: None,
+        },
+        &SystemContext::default(),
+    );
     assert!(!report.contains("alice"));
     assert!(!report.contains("192.168"));
     assert!(!report.contains("S-1-5-21"));
@@ -446,8 +520,7 @@ fn anchor_group_includes_signals_near_any_anchor() {
     let mut late = Signal::new("eventlog", now + Duration::seconds(35));
     late.provider = "nvlddmkm".to_owned();
     late.event_id = Some(153);
-    late
-        .fields
+    late.fields
         .insert("channel".to_owned(), "System".to_owned());
     late.detail = "GPUID 10de:1b06".to_owned();
 
@@ -467,6 +540,87 @@ fn anchor_group_includes_signals_near_any_anchor() {
             .any(|finding| finding.verdict.contains("NVIDIA GPU driver timeout")),
         "TDR verdict missing: {:?}",
         incidents[0].findings
+    );
+}
+
+#[test]
+fn overlapping_anchor_groups_do_not_duplicate_signals() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    // 0s and 29s form the first primary group (window = 30s). The WER at 44s
+    // is within that group's expanded upper bound and must be consumed there.
+    let first = Signal::new("game_log", now);
+    let second = Signal::new("game_log", now + Duration::seconds(29));
+    let mut wer = Signal::new("wer", now + Duration::seconds(44));
+    wer.provider = "WER".to_owned();
+    wer.loaded_modules = vec![r"D:\Games\Game\RTSSHooks64.dll".to_owned()];
+
+    let mut tdr = Signal::new("eventlog", now + Duration::seconds(40));
+    tdr.provider = "nvlddmkm".to_owned();
+    tdr.event_id = Some(153);
+    tdr.fields.insert("channel".to_owned(), "System".to_owned());
+    tdr.detail = "GPUID 10de:1b06".to_owned();
+
+    let analysis = framefault::correlate::run(&[first, second, wer, tdr], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    assert_eq!(
+        incidents.len(),
+        1,
+        "overlapping groups must not create a second incident: {incidents:#?}"
+    );
+    assert_eq!(
+        incidents[0]
+            .findings
+            .iter()
+            .filter(|finding| finding.verdict.contains("overlay/proxy DLL"))
+            .count(),
+        1,
+        "the WER signal was duplicated: {:?}",
+        incidents[0].findings
+    );
+    assert_eq!(
+        incidents[0].time,
+        now + Duration::seconds(29),
+        "incident time must be the newest anchor of the group"
+    );
+}
+
+#[test]
+fn equal_score_findings_have_a_stable_order() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut whea = Signal::new("eventlog", now);
+    whea.provider = "Microsoft-Windows-WHEA-Logger".to_owned();
+    whea.event_id = Some(18);
+    whea.fields
+        .insert("channel".to_owned(), "System".to_owned());
+    whea.detail = "A fatal hardware error has occurred.".to_owned();
+
+    let mut commit = Signal::new("eventlog", now);
+    commit.provider = "Microsoft-Windows-Resource-Exhaustion-Detector".to_owned();
+    commit.event_id = Some(2004);
+    commit
+        .fields
+        .insert("channel".to_owned(), "System".to_owned());
+    commit.detail = "Windows diagnosed a low virtual memory condition.".to_owned();
+
+    let analysis = framefault::correlate::run(&[whea, commit], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let verdicts: Vec<&str> = incidents[0]
+        .findings
+        .iter()
+        .map(|finding| finding.verdict.as_str())
+        .collect();
+    assert_eq!(verdicts.len(), 2, "{verdicts:#?}");
+    assert!(
+        verdicts[0].starts_with("Hardware / PCIe") && verdicts[1].starts_with("Low virtual memory"),
+        "equal scores must sort by verdict: {verdicts:#?}"
     );
 }
 
@@ -529,7 +683,50 @@ fn live_kernel_141_needs_an_explicit_live_kernel_code() {
     assert_eq!(live.len(), 1);
     let live = &live[0];
     assert_eq!(live.get("LiveKernelCode"), Some("141"));
-    assert!(rule.matches(live), "explicit LiveKernelEvent 141 must match");
+    assert!(
+        rule.matches(live),
+        "explicit LiveKernelEvent 141 must match"
+    );
+}
+
+#[test]
+fn kernel_power_41_prefers_bugcheck_code_over_parameter() {
+    let ruleset = framefault::rules::load();
+    let now = Local::now();
+
+    let mut event = Signal::new("eventlog", now);
+    event.provider = "Microsoft-Windows-Kernel-Power".to_owned();
+    event.event_id = Some(41);
+    event
+        .fields
+        .insert("channel".to_owned(), "System".to_owned());
+    event
+        .fields
+        .insert("BugcheckCode".to_owned(), "59".to_owned());
+    event.detail = "BugcheckCode=59\nBugcheckParameter1=0xc0000005\n".to_owned();
+
+    let analysis = framefault::correlate::run(&[event], &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let finding = incidents[0]
+        .findings
+        .iter()
+        .find(|finding| finding.verdict.contains("BSOD 0x0000003B"))
+        .unwrap_or_else(|| panic!("wrong bugcheck verdict: {:#?}", incidents[0].findings));
+    assert!(
+        !finding.verdict.contains("C0000005"),
+        "parameter won over BugcheckCode: {}",
+        finding.verdict
+    );
+    assert!(
+        finding
+            .next_steps
+            .iter()
+            .any(|step| step.contains("System call fault")),
+        "wrong next steps: {:?}",
+        finding.next_steps
+    );
 }
 
 #[test]
@@ -608,9 +805,10 @@ fn system32_dxgi_in_wer_does_not_make_a_bsod_a_gpu_incident() {
 
     let mut wer = framefault::sources::wer::scan(&fixtures().join("Report.wer"));
     assert_eq!(wer.len(), 1);
-    assert!(wer[0].loaded_modules.iter().any(|path| path
-        .to_ascii_lowercase()
-        .contains(r"\system32\dxgi.dll")));
+    assert!(wer[0]
+        .loaded_modules
+        .iter()
+        .any(|path| path.to_ascii_lowercase().contains(r"\system32\dxgi.dll")));
     assert!(
         !wer[0].detail.to_ascii_lowercase().contains("dxgi.dll"),
         "system module leaked into evidence: {}",
@@ -661,11 +859,8 @@ fn verdict_and_next_steps_are_redacted_in_report() {
             note: Some("Historical evidence from C:\\Users\\alice\\Report.wer".to_owned()),
         }],
     };
-    let report = framefault::report::markdown_for_incident(
-        &SystemContext::default(),
-        &incident,
-        None,
-    );
+    let report =
+        framefault::report::markdown_for_incident(&SystemContext::default(), &incident, None);
     assert!(!report.contains("alice"), "unredacted PII: {report}");
     assert!(report.contains("C:\\Users\\%USERPROFILE%"), "{report}");
     assert!(
@@ -730,4 +925,3 @@ fn standalone_bugcheck_1001_makes_a_decoded_incident() {
         incidents[0].findings
     );
 }
-

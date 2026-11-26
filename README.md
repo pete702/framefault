@@ -16,7 +16,9 @@ FrameFault reads the crash evidence Windows already keeps — Event Log, WER rep
 
 **[Download the latest release](../../releases/latest)** · Windows 10/11 (64-bit)
 
-Unzip `framefault-v*-win64.zip`, run `framefault.exe`, and drop a crash folder — or a `.wer`, `.xml` or `.log` file — onto the window. FrameFault also scans Windows crash logs automatically on launch. When you have a verdict, **Copy Clean Report** puts an anonymous Markdown report on your clipboard.
+Unzip `framefault-v*-win64.zip`, run `framefault.exe`, and drop a crash folder — or a `.wer`, `.xml` or `.log` file — onto the window. A dropped `.wer` is read as-is; folder discovery looks for `Report*.wer`. A dropped `.xml` is accepted when it contains `<CrashContext>`; folder discovery uses the canonical `CrashContext.runtime-xml`. `.log` files are read as-is, and automatic scanning covers Unreal `Saved\Logs` and Unity `Player.log` under LocalLow. `.dmp` files are not parsed in v0.1.x.
+
+FrameFault also scans Windows crash logs automatically on launch. When you have a verdict, **Copy Clean Report** puts an anonymous Markdown report on your clipboard.
 
 No installation. No admin/UAC. No drivers. No telemetry.
 
@@ -51,7 +53,7 @@ Next steps   Remove GPU overclock / undervolt
 | Source | What it adds |
 |---|---|
 | Windows Event Log (System + Application) | GPU timeouts (TDR), WER events, application errors, BSOD codes |
-| WER `Report.wer` (UTF-16LE / UTF-8) | Faulting module, exception code, loaded modules, overlay DLLs |
+| WER `Report*.wer` (UTF-16LE / UTF-16BE / UTF-8) | Faulting module, exception code, loaded modules, overlay DLLs |
 | Unreal `CrashContext.runtime-xml` | Engine crash context, GPU and device information |
 | Unity `Player.log` and generic game logs | Engine errors, device-lost messages, the last lines before the crash |
 | Windows hardware context | GPU and driver version, RAM/commit/pagefile, MPO state, live overlays |
@@ -85,13 +87,13 @@ Windows 10 or 11, 64-bit.
 
 ## Honest boundaries
 
-FrameFault is 100% read-only and never guesses. If the Event Log ring buffer no longer reaches the crash time, it shows the real depth (`System log reaches back to: ...`) instead of claiming "no crash found". Historical WER overlay evidence is labelled as historical, and live overlay processes as "now, not crash time" — the two are never mixed.
+FrameFault is 100% read-only and never guesses. If the Event Log ring buffer no longer reaches the crash time, it shows the real depth (`Event Log ring buffer: System -> ... | Application -> ...`) instead of claiming "no crash found". Historical WER overlay evidence is labelled as historical, and live overlay processes as "now, not crash time" — the two are never mixed.
 
 ## How correlation works
 
 1. **Collect** read-only signals from Event Log, WER, Unreal XML, Unity/game logs and Windows hardware context.
 2. **Anchor** on the newest crash event, then group all signals within ±15 seconds of any anchor in the chain (up to ~60 seconds for a chain of anchors).
-3. **Correlate** by time, process and module; deduplicate and rank independent sources.
+3. **Correlate** by time; rule matching then uses provider, event ID, faulting module and other fields. Deduplicate and rank independent sources.
 4. **Explain** each cause with a timestamped evidence chain, confidence, official links and next steps.
 5. **Redact** irreversibly before any report leaves the app.
 
@@ -111,7 +113,7 @@ cargo build --release
 
 Run these from the repository root. The release profile in `Cargo.toml` sets `opt-level="z"`, `lto="fat"`, `strip="symbols"`, `panic="abort"` and a single codegen unit; eframe uses `glow` only. `windows_subsystem="windows"` is declared in `src/main.rs` via `cfg_attr(all(windows, not(feature = "cli")), ...)`, so the CLI feature keeps a console.
 
-Optional Cargo features: `cli` enables the headless mode (`--self-test`, `--markdown`, `--days`), and `evtx` enables the fallback reader for exported `.evtx` files through `wevtutil` (no extra crate). CI checks both features with the `--all-features` commands above.
+Optional Cargo features: `cli` enables the headless mode (`--self-test`, `--markdown`, `--days`, `--version`), and `evtx` enables the fallback reader for exported `.evtx` files through `wevtutil` (no extra crate). CI checks both features with the `--all-features` commands above.
 
 Rules and official references live in `rules.toml` (embedded into the binary at compile time — no extra file needed to run).
 

@@ -41,7 +41,12 @@ pub fn scan(root: &Path) -> Vec<Signal> {
     };
 
     if root.is_file() {
-        if is_wer_name(&root.file_name().unwrap_or_default().to_string_lossy()) {
+        // An explicitly dropped file is authoritative: accept any *.wer and
+        // do not mix in unrelated machine-wide reports.
+        let is_wer = root
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wer"));
+        if is_wer {
             add(root.to_path_buf());
         }
     } else {
@@ -50,17 +55,17 @@ pub fn scan(root: &Path) -> Vec<Signal> {
                 add(entry.path().to_path_buf());
             }
         }
-    }
 
-    // Per-user WER first, then machine-wide. AccessDenied is silently ignored.
-    if let Some(local) = dirs::data_local_dir() {
-        for dir in ["ReportArchive", "ReportQueue"] {
-            collect_wer_dir(&local.join("Microsoft\\Windows\\WER").join(dir), &mut add);
+        // Per-user WER first, then machine-wide. AccessDenied is silently ignored.
+        if let Some(local) = dirs::data_local_dir() {
+            for dir in ["ReportArchive", "ReportQueue"] {
+                collect_wer_dir(&local.join("Microsoft\\Windows\\WER").join(dir), &mut add);
+            }
         }
-    }
-    let programdata = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\WER");
-    for dir in ["ReportArchive", "ReportQueue"] {
-        collect_wer_dir(&programdata.join(dir), &mut add);
+        let programdata = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\WER");
+        for dir in ["ReportArchive", "ReportQueue"] {
+            collect_wer_dir(&programdata.join(dir), &mut add);
+        }
     }
 
     // Newest first; path breaks ties so the 25-file cap is deterministic
@@ -74,7 +79,9 @@ pub fn scan(root: &Path) -> Vec<Signal> {
 }
 
 fn collect_wer_dir<F: FnMut(PathBuf)>(dir: &Path, add: &mut F) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -99,6 +106,14 @@ fn read_wer_text(path: &Path) -> Option<String> {
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         Some(String::from_utf16_lossy(&units))
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = bytes[2..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units))
     } else {
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
@@ -111,7 +126,8 @@ fn live_kernel_141_code(
     fields: &std::collections::HashMap<String, String>,
 ) -> Option<&'static str> {
     let is_live_kernel = fields.iter().any(|(key, value)| {
-        key.eq_ignore_ascii_case("EventType") && value.trim().eq_ignore_ascii_case("LiveKernelEvent")
+        key.eq_ignore_ascii_case("EventType")
+            && value.trim().eq_ignore_ascii_case("LiveKernelEvent")
     });
     if !is_live_kernel {
         return None;
@@ -136,7 +152,9 @@ fn live_kernel_141_code(
 }
 
 /// WER has shipped several casings of the same timestamp keys over the years.
-fn report_time(fields: &std::collections::HashMap<String, String>) -> Option<DateTime<chrono::Local>> {
+fn report_time(
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<DateTime<chrono::Local>> {
     [
         "ReportCreateTimeStamp",
         "TimeCreated",
@@ -168,9 +186,14 @@ fn parse(path: &Path) -> Option<Signal> {
     // plain BSOD look like a GPU/game incident.
     let mut detail_lines: Vec<String> = Vec::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         let key = key.trim();
         let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
         if key.to_ascii_lowercase().starts_with("loadedmodule") {
             modules.push(value.to_owned());
             if !is_system_dll_path(value) {
@@ -216,7 +239,10 @@ mod tests {
             "2026-11-25T10:00:00".to_owned(),
         );
         let parsed = report_time(&fields).expect("lowercase timestamp key must be accepted");
-        assert_eq!(parsed.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-11-25 10:00:00");
+        assert_eq!(
+            parsed.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-11-25 10:00:00"
+        );
 
         fields.clear();
         fields.insert("EventTime".to_owned(), "not a date".to_owned());
