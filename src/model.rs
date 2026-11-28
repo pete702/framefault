@@ -15,7 +15,13 @@ pub fn parse_timestamp(value: &str) -> Option<DateTime<Local>> {
         "%m/%d/%Y %H:%M:%S",
     ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
-            if let Some(local) = Local.from_local_datetime(&naive).single() {
+            // DST fall-back yields two possible instants; pick the earliest
+            // deterministically instead of dropping the timestamp.
+            if let Some(local) = Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .or_else(|| Local.from_local_datetime(&naive).latest())
+            {
                 return Some(local);
             }
         }
@@ -75,6 +81,11 @@ pub struct Incident {
     pub title: String,
     pub time: DateTime<Local>,
     pub findings: Vec<Finding>,
+    /// Total occurrences of the same (app, primary verdict) inside the
+    /// selected window. Always at least 1.
+    pub repeat_count: usize,
+    /// Earliest occurrence of a repeated crash; `None` for a lone incident.
+    pub first_seen: Option<DateTime<Local>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -109,7 +120,7 @@ pub struct SystemContext {
     pub hags: String,
     /// Non-default TDR registry overrides, if any.
     pub tdr_note: Option<String>,
-    /// Low free space on C: or the pagefile drive, if any.
+    /// Low free space on the system drive or a dynamic pagefile drive, if any.
     pub disk_warn: Option<String>,
     /// Time since the last full boot, in hours.
     pub uptime_hours: u64,

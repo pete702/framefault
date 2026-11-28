@@ -26,6 +26,14 @@ fn is_wer_name(name: &str) -> bool {
     lower.starts_with("report") && lower.ends_with(".wer")
 }
 
+/// Machine-wide WER may live on any drive (`%ProgramData%`).
+fn program_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
 pub fn scan(root: &Path) -> Vec<Signal> {
     let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut seen = HashSet::new();
@@ -50,6 +58,13 @@ pub fn scan(root: &Path) -> Vec<Signal> {
             add(root.to_path_buf());
         }
     } else {
+        // A missing explicit path must not fall back to machine-wide reports.
+        // Only the default LocalAppData launch may scan machine WER folders.
+        let is_default_local = dirs::data_local_dir().is_some_and(|dir| dir.as_path() == root);
+        if !root.exists() && !is_default_local {
+            return Vec::new();
+        }
+
         for entry in WalkDir::new(root).max_depth(8).into_iter().flatten() {
             if is_wer_name(&entry.file_name().to_string_lossy()) {
                 add(entry.path().to_path_buf());
@@ -62,7 +77,7 @@ pub fn scan(root: &Path) -> Vec<Signal> {
                 collect_wer_dir(&local.join("Microsoft\\Windows\\WER").join(dir), &mut add);
             }
         }
-        let programdata = PathBuf::from(r"C:\ProgramData\Microsoft\Windows\WER");
+        let programdata = program_data_dir().join(r"Microsoft\Windows\WER");
         for dir in ["ReportArchive", "ReportQueue"] {
             collect_wer_dir(&programdata.join(dir), &mut add);
         }
@@ -260,6 +275,11 @@ mod tests {
         }
         assert!(!is_system_dll_path(r"D:\Games\Game\dxgi.dll"));
         assert!(!is_system_dll_path(r"D:\MyWindows\System32\dxgi.dll"));
+    }
+
+    #[test]
+    fn missing_root_does_not_fall_back_to_machine_wide_wer() {
+        assert!(scan(Path::new(r"Z:\definitely_missing_path_xyz")).is_empty());
     }
 
     #[test]

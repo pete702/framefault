@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Local};
+
 use crate::model::{Analysis, Finding, Incident, Signal};
 use crate::rules::RuleSet;
 
@@ -79,8 +81,9 @@ fn take_group<'a>(
 }
 
 /// Groups signals into incidents. Primary anchors (WER, UE/Unity/game logs,
-/// Event 1000) are preferred; critical system events that did not fall into
-/// any primary window become fallback anchors instead of being dropped.
+/// user-mode minidumps, Event 1000) are preferred; critical system events that
+/// did not fall into any primary window become fallback anchors instead of
+/// being dropped.
 pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
     if signals.is_empty() {
         return Analysis::Empty;
@@ -93,6 +96,7 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
                 || s.source == "ue_xml"
                 || s.source == "unity_log"
                 || s.source == "game_log"
+                || s.source == "dmp"
                 || (s.source == "eventlog" && s.event_id == Some(1000))
         })
         .collect();
@@ -175,6 +179,8 @@ pub fn run(signals: &[Signal], ruleset: &RuleSet) -> Analysis {
             title,
             time,
             findings,
+            repeat_count: 1,
+            first_seen: None,
         });
     }
 
@@ -252,6 +258,16 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
                     }
                 }
             }
+            if rule.id == "dmp_crash" {
+                if let Some(raw) = signal.get("ExceptionCode") {
+                    if let Some(code) = crate::codes::parse_exception_code(raw) {
+                        let advice = crate::codes::decode_exception(code).1;
+                        if !entry.next_steps.iter().any(|step| step == advice) {
+                            entry.next_steps.push(advice.to_owned());
+                        }
+                    }
+                }
+            }
             if entry.next_steps.is_empty() {
                 entry.next_steps = rule.next_steps.clone();
             }
@@ -279,4 +295,50 @@ fn findings_from(signals: &[&Signal], ruleset: &RuleSet) -> Vec<Finding> {
     findings.sort_by_key(|finding| (std::cmp::Reverse(finding.score), finding.verdict.clone()));
     findings.truncate(12);
     findings
+}
+
+/// App part of a title: everything before " - ", lowercased.
+fn repeated_app_key(title: &str) -> String {
+    title
+        .split(" - ")
+        .next()
+        .unwrap_or(title)
+        .trim()
+        .to_lowercase()
+}
+
+/// Counts repeated (app, primary verdict) crashes across the incident list
+/// that is already filtered by the selected day window, without merging any
+/// chronological rows. Call this after the day filter but before UI-only
+/// filters (hidden apps, category, search), so the count matches the window
+/// the user sees and search cannot change it.
+pub fn attach_frequencies(incidents: &mut [Incident]) {
+    let mut groups: HashMap<(String, String), (usize, DateTime<Local>)> = HashMap::new();
+    for incident in incidents.iter() {
+        let app = repeated_app_key(&incident.title);
+        let verdict = incident
+            .findings
+            .first()
+            .map(|finding| finding.verdict.clone())
+            .unwrap_or_default();
+        let entry = groups.entry((app, verdict)).or_insert((0, incident.time));
+        entry.0 += 1;
+        if incident.time < entry.1 {
+            entry.1 = incident.time;
+        }
+    }
+
+    for incident in incidents.iter_mut() {
+        let app = repeated_app_key(&incident.title);
+        let verdict = incident
+            .findings
+            .first()
+            .map(|finding| finding.verdict.clone())
+            .unwrap_or_default();
+        let Some((count, earliest)) = groups.get(&(app, verdict)) else {
+            continue;
+        };
+        incident.repeat_count = *count;
+        incident.first_seen = if *count > 1 { Some(*earliest) } else { None };
+    }
 }

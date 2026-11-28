@@ -213,7 +213,7 @@ fn unity_player_log_dxgi_error_produces_a_verdict() {
         incidents[0]
             .findings
             .iter()
-            .any(|finding| finding.verdict.contains("Game lost the D3D device")),
+            .any(|finding| finding.verdict.contains("lost the D3D device")),
         "DXGI verdict missing: {:?}",
         incidents[0].findings
     );
@@ -333,6 +333,8 @@ fn redaction_and_self_test_are_silent_about_identity() {
                     link: None,
                     note: None,
                 }],
+                repeat_count: 1,
+                first_seen: None,
             }],
             note: None,
         },
@@ -858,6 +860,8 @@ fn verdict_and_next_steps_are_redacted_in_report() {
             link: None,
             note: Some("Historical evidence from C:\\Users\\alice\\Report.wer".to_owned()),
         }],
+        repeat_count: 1,
+        first_seen: None,
     };
     let report =
         framefault::report::markdown_for_incident(&SystemContext::default(), &incident, None);
@@ -924,4 +928,210 @@ fn standalone_bugcheck_1001_makes_a_decoded_incident() {
         "findings: {:?}",
         incidents[0].findings
     );
+}
+
+fn incident_at(
+    title: &str,
+    verdict: &str,
+    time: chrono::DateTime<Local>,
+) -> framefault::model::Incident {
+    framefault::model::Incident {
+        title: title.to_owned(),
+        time,
+        findings: vec![framefault::model::Finding {
+            verdict: verdict.to_owned(),
+            score: 1,
+            confidence: "Info".to_owned(),
+            source_count: 1,
+            evidence: Vec::new(),
+            next_steps: Vec::new(),
+            link: None,
+            note: None,
+        }],
+        repeat_count: 1,
+        first_seen: None,
+    }
+}
+
+#[test]
+fn frequencies_count_repeats_without_merging_the_chronological_rows() {
+    let now = Local::now();
+    let earliest = now - Duration::days(6);
+    let middle = now - Duration::days(2);
+
+    let mut incidents = vec![
+        incident_at("Game.exe - Crash in level 3", "GPU driver timeout", now),
+        incident_at(
+            "Game.exe - Crash in level 1",
+            "GPU driver timeout",
+            earliest,
+        ),
+        incident_at("Game.exe - Crash in level 2", "GPU driver timeout", middle),
+        incident_at("Other.exe - Crash", "CPU fault", now),
+    ];
+
+    framefault::correlate::attach_frequencies(&mut incidents);
+
+    assert_eq!(incidents.len(), 4, "rows must never be merged");
+    for repeated in &incidents[..3] {
+        assert_eq!(repeated.repeat_count, 3, "{repeated:#?}");
+        assert_eq!(repeated.first_seen, Some(earliest), "{repeated:#?}");
+    }
+    assert_eq!(incidents[3].repeat_count, 1);
+    assert_eq!(incidents[3].first_seen, None);
+
+    // Same app, different primary verdict: each verdict is its own one-off.
+    let mut mismatched = vec![
+        incident_at("Game.exe - Crash A", "GPU driver timeout", now),
+        incident_at("Game.exe - Crash B", "CPU fault", now),
+    ];
+    framefault::correlate::attach_frequencies(&mut mismatched);
+    for incident in &mismatched {
+        assert_eq!(
+            incident.repeat_count, 1,
+            "a different primary verdict must not merge: {incident:#?}"
+        );
+        assert_eq!(incident.first_seen, None, "{incident:#?}");
+    }
+}
+
+fn mdmp_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn mdmp_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn mdmp_name(out: &mut Vec<u8>, value: &str) {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    mdmp_u32(out, (units.len() * 2) as u32);
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes());
+}
+
+fn mdmp_module(out: &mut Vec<u8>, base: u64, size: u32, name_rva: u32) {
+    mdmp_u64(out, base);
+    mdmp_u32(out, size);
+    mdmp_u32(out, 0); // checksum
+    mdmp_u32(out, 0); // PE timestamp
+    mdmp_u32(out, name_rva);
+    out.extend_from_slice(&[0u8; 52]); // VS_FIXEDFILEINFO
+    mdmp_u32(out, 0);
+    mdmp_u32(out, 0); // CV record
+    mdmp_u32(out, 0);
+    mdmp_u32(out, 0); // misc record
+    out.extend_from_slice(&[0u8; 8]);
+    out.extend_from_slice(&[0u8; 8]);
+}
+
+/// Minimal user-mode MDMP with one exception stream and two modules.
+fn mdmp_bytes() -> Vec<u8> {
+    const HEADER: usize = 32;
+    const DIRECTORY: usize = 24;
+    const EXCEPTION: usize = HEADER + DIRECTORY;
+    const EXCEPTION_SIZE: usize = 168;
+    const MODULES: usize = EXCEPTION + EXCEPTION_SIZE;
+    const MODULE_SIZE: usize = 108;
+    const MODULE_LIST_SIZE: usize = 4 + 2 * MODULE_SIZE;
+    const NAME1: usize = MODULES + MODULE_LIST_SIZE;
+
+    let game = r"C:\Games\Game\Game.dll";
+    let system = r"C:\Windows\System32\kernel32.dll";
+    let name1_size = 4 + game.encode_utf16().count() * 2 + 2;
+    let name2 = NAME1 + name1_size;
+
+    let mut out = Vec::new();
+    mdmp_u32(&mut out, 0x504D_444D);
+    mdmp_u32(&mut out, 0x0000_A793);
+    mdmp_u32(&mut out, 2);
+    mdmp_u32(&mut out, HEADER as u32);
+    mdmp_u32(&mut out, 0);
+    mdmp_u32(&mut out, 1_765_000_000);
+    mdmp_u64(&mut out, 0);
+
+    mdmp_u32(&mut out, 6);
+    mdmp_u32(&mut out, EXCEPTION_SIZE as u32);
+    mdmp_u32(&mut out, EXCEPTION as u32);
+    mdmp_u32(&mut out, 4);
+    mdmp_u32(&mut out, MODULE_LIST_SIZE as u32);
+    mdmp_u32(&mut out, MODULES as u32);
+
+    mdmp_u32(&mut out, 1); // thread
+    mdmp_u32(&mut out, 0);
+    mdmp_u32(&mut out, 0xC000_0005); // exception code
+    mdmp_u32(&mut out, 0);
+    mdmp_u64(&mut out, 0);
+    mdmp_u64(&mut out, 0x1000_1234); // crash address inside Game.dll
+    mdmp_u32(&mut out, 2);
+    mdmp_u32(&mut out, 0);
+    for _ in 0..15 {
+        mdmp_u64(&mut out, 0);
+    }
+    mdmp_u32(&mut out, 0);
+    mdmp_u32(&mut out, 0); // thread context
+
+    mdmp_u32(&mut out, 2); // module count
+    mdmp_module(&mut out, 0x1000_0000, 0x1_0000, NAME1 as u32);
+    mdmp_module(&mut out, 0x2000_0000, 0x2_0000, name2 as u32);
+    mdmp_name(&mut out, game);
+    mdmp_name(&mut out, system);
+    out
+}
+
+#[test]
+fn user_mode_minidump_produces_a_decoded_incident() {
+    let unique = format!(
+        "framefault-mdmp-{}-{}.dmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    );
+    let path = std::env::temp_dir().join(unique);
+    std::fs::write(&path, mdmp_bytes()).expect("write synthetic minidump");
+
+    let signals = framefault::sources::dmp::scan(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(signals.len(), 1, "explicit dump must produce one signal");
+    assert_eq!(signals[0].source, "dmp");
+    assert_eq!(signals[0].get("ExceptionCode"), Some("0xC0000005"));
+    assert_eq!(signals[0].get("FaultingModule"), Some("Game.dll"));
+    assert!(
+        signals[0]
+            .loaded_modules
+            .iter()
+            .all(|path| !path.to_ascii_lowercase().contains(r"\windows\system32\")),
+        "system modules must stay out of loaded_modules: {:?}",
+        signals[0].loaded_modules
+    );
+
+    let ruleset = framefault::rules::load();
+    let analysis = framefault::correlate::run(&signals, &ruleset);
+    let Analysis::Results { incidents, .. } = &analysis else {
+        panic!("expected incidents, got {analysis:?}");
+    };
+    let finding = incidents[0]
+        .findings
+        .iter()
+        .find(|finding| finding.verdict.contains("ACCESS_VIOLATION"))
+        .unwrap_or_else(|| panic!("decoded dmp verdict missing: {:#?}", incidents[0]));
+    assert!(
+        finding.verdict.contains("Game.dll"),
+        "{:?}",
+        finding.verdict
+    );
+    assert!(
+        finding
+            .next_steps
+            .iter()
+            .any(|step| step.contains("Invalid memory access")),
+        "decoded exception advice missing: {:?}",
+        finding.next_steps
+    );
+    assert_eq!(incidents[0].time, signals[0].t);
 }

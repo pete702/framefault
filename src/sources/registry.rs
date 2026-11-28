@@ -259,13 +259,31 @@ fn pagefile_drive(pagefile: &str) -> Option<String> {
     None
 }
 
-/// Drives to check for free space. C: is always checked. A pagefile drive is
-/// checked only when its pagefile can grow (min != max or system managed):
-/// a fixed pagefile (min == max > 0) has nowhere to grow, so low free space
-/// there is expected and must not be reported as a warning.
+/// Drives to check for free space. The system drive is always checked. A
+/// pagefile drive is checked only when its pagefile can grow (min != max or
+/// system managed): a fixed pagefile (min == max > 0) has nowhere to grow, so
+/// low free space there is expected and must not be reported as a warning.
+#[cfg(any(windows, test))]
+fn system_drive() -> String {
+    std::env::var("SystemDrive")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('\\').to_ascii_uppercase())
+        .filter(|value| {
+            value.len() == 2
+                && value.as_bytes()[0].is_ascii_alphabetic()
+                && value.as_bytes()[1] == b':'
+        })
+        .unwrap_or_else(|| "C:".to_owned())
+}
+
 #[cfg(any(windows, test))]
 fn pagefile_targets(values: &[String]) -> Vec<String> {
-    let mut drives = vec!["C:".to_owned()];
+    pagefile_targets_with_system(&system_drive(), values)
+}
+
+#[cfg(any(windows, test))]
+fn pagefile_targets_with_system(system: &str, values: &[String]) -> Vec<String> {
+    let mut drives = vec![system.to_owned()];
     for entry in values {
         let mut parts = entry.split_whitespace();
         let path = parts.next().unwrap_or("");
@@ -277,7 +295,10 @@ fn pagefile_targets(values: &[String]) -> Vec<String> {
         let Some(drive) = pagefile_drive(path) else {
             continue;
         };
-        if !drives.iter().any(|known| known == &drive) {
+        if !drives
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&drive))
+        {
             drives.push(drive);
         }
     }
@@ -396,33 +417,43 @@ fn dxgi_gpu_name() -> Option<String> {
 
 #[cfg(any(windows, test))]
 fn human_pagefile(values: &[String]) -> String {
-    let Some(first) = values.first() else {
-        return "unknown".to_owned();
-    };
-    let parts: Vec<&str> = first.split_whitespace().collect();
-    let path = parts.first().copied().unwrap_or("");
-    let drive = path
-        .chars()
-        .take(2)
-        .collect::<String>()
-        .trim_end_matches(':')
-        .to_owned();
+    let mut parts: Vec<String> = Vec::new();
+    for entry in values {
+        if let Some(text) = human_pagefile_entry(entry) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        "system managed".to_owned()
+    } else {
+        parts.join("; ")
+    }
+}
+
+#[cfg(any(windows, test))]
+fn human_pagefile_entry(entry: &str) -> Option<String> {
+    let mut parts = entry.split_whitespace();
+    let raw_path = parts.next()?;
+    let path = raw_path.strip_prefix(r"\??\").unwrap_or(raw_path);
     let min_mb = parts
-        .get(1)
+        .next()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let max_mb = parts
-        .get(2)
+        .next()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    // `0 0` and `?:` mean Windows manages the file size and location.
+    if min_mb == 0 && max_mb == 0 || path.starts_with("?:") {
+        return Some("system managed".to_owned());
+    }
+    let drive = pagefile_drive(path)?;
     let min_gib = min_mb as f64 / 1024.0;
     let max_gib = max_mb as f64 / 1024.0;
-    if drive.is_empty() || (min_mb == 0 && max_mb == 0) {
-        "system managed".to_owned()
-    } else if min_mb == max_mb {
-        format!("{min_gib:.1} GiB fixed ({drive}:)")
+    if min_mb == max_mb {
+        Some(format!("{min_gib:.1} GiB fixed ({drive})"))
     } else {
-        format!("{min_gib:.1}-{max_gib:.1} GiB ({drive}:)")
+        Some(format!("{min_gib:.1}-{max_gib:.1} GiB ({drive})"))
     }
 }
 
@@ -576,6 +607,31 @@ mod tests {
     }
 
     #[test]
+    fn multiple_pagefiles_are_all_rendered() {
+        let values = vec![
+            r"C:\pagefile.sys 2048 4096".to_owned(),
+            r"E:\pagefile.sys 13685 13685".to_owned(),
+        ];
+        assert_eq!(
+            human_pagefile(&values),
+            "2.0-4.0 GiB (C:); 13.4 GiB fixed (E:)"
+        );
+    }
+
+    #[test]
+    fn native_and_unknown_pagefile_paths_are_parsed() {
+        let native = vec![r"\??\D:\pagefile.sys 2048 4096".to_owned()];
+        assert_eq!(human_pagefile(&native), "2.0-4.0 GiB (D:)");
+
+        let anywhere = vec![r"?:\pagefile.sys 0 0".to_owned()];
+        assert_eq!(human_pagefile(&anywhere), "system managed");
+
+        // `?:` is system-managed location semantics even with explicit sizes.
+        let anywhere_sized = vec![r"?:\pagefile.sys 2048 4096".to_owned()];
+        assert_eq!(human_pagefile(&anywhere_sized), "system managed");
+    }
+
+    #[test]
     fn pagefile_drive_is_extracted() {
         assert_eq!(pagefile_drive("12.0 GiB (E:)"), Some("E:".to_owned()));
         assert_eq!(pagefile_drive("system managed"), None);
@@ -585,23 +641,43 @@ mod tests {
     #[test]
     fn fixed_pagefile_drive_is_not_checked_for_free_space() {
         let fixed = vec![r"E:\pagefile.sys 13685 13685".to_owned()];
-        assert_eq!(pagefile_targets(&fixed), vec!["C:".to_owned()]);
+        assert_eq!(
+            pagefile_targets_with_system("C:", &fixed),
+            vec!["C:".to_owned()]
+        );
 
         let dynamic = vec![r"E:\pagefile.sys 2048 16384".to_owned()];
         assert_eq!(
-            pagefile_targets(&dynamic),
+            pagefile_targets_with_system("C:", &dynamic),
             vec!["C:".to_owned(), "E:".to_owned()]
         );
 
         // System managed on an explicit drive can still grow.
         let managed = vec![r"E:\pagefile.sys 0 0".to_owned()];
         assert_eq!(
-            pagefile_targets(&managed),
+            pagefile_targets_with_system("C:", &managed),
             vec!["C:".to_owned(), "E:".to_owned()]
         );
 
         // Windows' "?:\\pagefile.sys" has no drive to check.
         let anywhere = vec![r"?:\pagefile.sys 0 0".to_owned()];
-        assert_eq!(pagefile_targets(&anywhere), vec!["C:".to_owned()]);
+        assert_eq!(
+            pagefile_targets_with_system("C:", &anywhere),
+            vec!["C:".to_owned()]
+        );
+    }
+
+    #[test]
+    fn system_drive_is_used_and_multi_pagefile_drives_are_included() {
+        let values = vec![
+            r"C:\pagefile.sys 2048 2048".to_owned(),
+            r"\??\D:\pagefile.sys 0 0".to_owned(),
+            r"E:\pagefile.sys 2048 4096".to_owned(),
+        ];
+        assert_eq!(
+            pagefile_targets_with_system("D:", &values),
+            vec!["D:".to_owned(), "E:".to_owned()],
+            "system drive plus every growable pagefile, without duplicates"
+        );
     }
 }

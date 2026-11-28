@@ -1,25 +1,55 @@
 # Changelog
 
+## [0.2.0]
+
+### Highlights & UI
+- **Crash frequency.** Repeated identical crashes are counted inside the selected 7d/14d/30d/All window and shown as `[xN]` next to the incident plus a `Frequency: N times ...` line in the details and copied report. Chronological rows are never merged.
+- **Folder watcher.** FrameFault watches the real Windows crash folders — per-user and machine-wide WER queues/archives (recursively), `%LOCALAPPDATA%\CrashDumps`, LocalLow (`Player.log` only) and UE `Saved\Crashes` — and rescans after a 1.5 s debounce. A manually dropped crash is never overwritten; **Return to local PC** switches back.
+- **Universal scope.** One verdict for Windows apps, GPU drivers, BSODs and PC game crashes, not just games.
+- The status bar now reports `User-space .dmp` instead of claiming dumps are ignored.
+
+### Accuracy & Parsers
+- **User-mode minidumps.** `.dmp` (MDMP) files are read through the `minidump` crate: crash time, exception code, faulting module and non-system module paths. No stack/heap memory, environment blocks, in-memory strings, symbols or PDB downloads.
+- Automatic dump discovery is limited to `%LOCALAPPDATA%\CrashDumps` and UE `Saved\Crashes`; dropped folders are searched to depth 5, newest six dumps. `C:\Windows\Minidump` and LiveKernelReports are never touched.
+- Kernel `PAGEDU64` dumps are detected safely: skipped in automatic scans and reported as unsupported (admin-only) when dropped explicitly. dmp verdicts decode the exception code and match anti-cheat modules.
+- Minidump events become primary anchors, so a dump-only crash still produces a verdict.
+- DMP GPU context appears only when a GPU/display module (`nvlddmkm`, `amdkmd`, `igdkmd`, `igfx`, `d3d11`, `d3d12`, `dxgi`) is named.
+- WER watchers now recurse into `ReportArchive\<folder>\Report.wer`.
+
+### Privacy & Redaction
+- Minidump evidence is limited to exception metadata and non-system module paths; no process memory is read.
+- Reports keep the existing irreversible redaction of profile paths, identifiers and network addresses before the clipboard.
+
+### Build & CI
+- Version 0.2.0. CI keeps `--locked`, formatting, clippy, all-feature tests, pinned third-party actions and least-privilege permissions.
+
 ## [0.1.8]
-- Event XML `SystemTime` is converted from UTC to local time; missing or malformed timestamps are skipped instead of becoming a fake "now" anchor.
-- `log_reach()` now reports the real Event Log ring-buffer depth; `read_recent()` uses `EvtQueryChannelPath`.
-- Event XML parser handles self-closing `<Data />` and `>` inside quoted attributes; `tag_value()` is quote-aware.
-- Correlation shares one `consumed` set across primary and fallback groups, uses the newest anchor for incident time, and sorts equal-score findings by verdict.
-- Ring-buffer note is kept for `NoAnchor` and shown in the GUI/report.
-- `BugcheckCode=59` is parsed correctly and takes priority over `BugcheckParameter1=0x...`; Kernel-Power 41 no longer reports the parameter as the stop code.
-- `match_field` is strict for named fields; `ue_oom_flag` no longer triggers from an unrelated `IsEnsure=true`.
-- WER title/module lookup understands `FaultingModule`; anti-cheat WER matching uses the real field; Unity logs are accepted by anti-cheat rules; `DXGI_ERROR_DEVICE_REMOVED` no longer produces a duplicate out-of-VRAM verdict.
-- WER skips empty values and supports UTF-16BE; a dropped `.wer` is read alone without mixing in machine-wide reports.
-- UE accepts a dropped `.xml` containing `<CrashContext>` and only puts whitelisted fields (plus optional CallStack) into evidence, so `EpicAccountId`, `LoginId` and similar IDs cannot leak.
-- Game logs are read lossily (non-UTF8 no longer discards the file), markers are case-insensitive, and mtime ties are broken by path.
-- Redaction is case-insensitive for `\Users\` / `Documents and Settings`, masks emails, `file://` URLs and 32-char hex IDs, and keeps sentence punctuation outside `[REDACTED-UNC]`.
-- System-DLL detection ignores trailing punctuation, GPU context markers are more precise (`igdlh64` added; broad anti-cheat/engine words removed), and unknown GPU/driver values no longer duplicate prefixes.
-- Markdown reports show `[confidence | source_count source(s)]`, apply clean-evidence filtering everywhere, and keep the NoAnchor ring-buffer note.
-- Pagefile display distinguishes fixed and dynamic sizes; registry adapter matching scans `0000..0015` and prefers the longest name match.
-- GUI handles a disconnected scan worker, supports `All` days plus older-incident hints, shows visible/total counts, deduplicates hidden apps, resets copied state, and removes the dead `last_scanned` field.
-- CLI adds `--version` and rejects `--days < 1`.
-- CI uses `--locked`, `cargo fmt --check`, CLI self-test smoke, and verifies the CHANGELOG section before publishing.
-- Bumped version to 0.1.8.
+
+### Highlights & UI
+- 7d/14d/30d/All filters with honest "older incidents found" hints; at 30 days the hint offers "All".
+- Visible/total counts, hidden-app deduplication, copied-state reset, and storage warnings that no longer assume `C:`.
+- Reports show confidence and independent source count, clean evidence, and the real Event Log ring-buffer depth, including on "no anchor" results.
+
+### Accuracy & Parsers
+- Event timestamps are converted from UTC to local time; timestamps in the DST fall-back hour use the earliest valid local instant.
+- Event XML parsing handles self-closing `<Data />`, `>` inside quoted attributes, and retries `EvtRender` when the buffer is too small.
+- Correlation shares one consumed set, anchors an incident on its newest event, sorts equal-score findings deterministically, and keeps standalone BSOD/WHEA/Kernel-Power 41/TDR/2004 events as fallback incidents.
+- Bugcheck parsing prefers `BugcheckCode` over `BugcheckParameter1`, and Kernel-Power 41 advice follows the decoded stop code.
+- WER supports UTF-16BE, skips empty values, understands `FaultingModule`, and reads a dropped `.wer` without mixing in machine-wide reports.
+- Paths use `%ProgramData%`, `%WINDIR%`, `%SystemRoot%` and `SystemDrive` instead of assuming `C:`.
+- Unreal XML accepts a dropped `<CrashContext>` file; folder discovery requires the tag in the first 4 KiB. Only whitelisted fields reach evidence, so account IDs cannot leak.
+- Game logs are read from a bounded 2 MiB tail with the partial first line dropped; anti-cheat markers require error context or an exact driver module.
+- Exported `.evtx` is read through `System32\wevtutil.exe` with `/f:xml`, a 10 s timeout and exit-status checking.
+- Pagefiles list every `PagingFiles` entry, understand `\??\` and `?:\`, and only growable pagefiles are checked for free space.
+- GPU markers are more precise; unknown GPU/driver values no longer duplicate prefixes.
+
+### Privacy & Redaction
+- Profile paths are matched case-insensitively; emails, `file://` URLs, 32-char hex IDs, SteamID64, keyed IDs (including quoted or spaced values) and dash MACs are masked. Sentence punctuation stays outside markers, and six-group numeric dates are not mistaken for MACs.
+
+### Build & CI
+- CLI adds `--version` and limits `--days` to `1..=3650`.
+- The 0.1.8 release uses `panic = "abort"`.
+- CI uses `--locked`, `cargo fmt --check`, a CLI self-test smoke run, least-privilege permissions, pinned third-party actions, and verifies the changelog section before publishing.
 
 ## 0.1.7
 - Exception codes without a `0x` prefix are decoded again, restoring Next steps for Application Error 1000.

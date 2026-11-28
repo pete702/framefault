@@ -1,13 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use chrono::{Duration, Local};
 use eframe::egui::{
     self, Color32, FontData, FontFamily, FontInsert, FontPriority, InsertFontFamily, RichText,
     TextureHandle, Vec2,
 };
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use walkdir::WalkDir;
 
 use crate::model::{Analysis, Incident, SystemContext};
 
@@ -32,6 +34,136 @@ fn short_cpu(cpu: &str) -> String {
     } else {
         format!("{}…", clean.chars().take(48).collect::<String>())
     }
+}
+
+fn has_component(path: &Path, name: &str) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(name)
+    })
+}
+
+fn in_saved_crashes(path: &Path) -> bool {
+    let parts: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    parts
+        .windows(2)
+        .any(|pair| pair[0] == "saved" && pair[1] == "crashes")
+}
+
+fn is_saved_crashes_dir(path: &Path) -> bool {
+    let mut parts = path.components().rev();
+    let crashes = parts.next().is_some_and(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("Crashes")
+    });
+    let saved = parts.next().is_some_and(|part| {
+        part.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("Saved")
+    });
+    crashes && saved
+}
+
+/// Windows stores `ReportArchive\<folder>\Report.wer`, so WER roots must be
+/// watched recursively.
+fn is_wer_dir(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let report_dir =
+        name.eq_ignore_ascii_case("ReportArchive") || name.eq_ignore_ascii_case("ReportQueue");
+    report_dir && has_component(path, "WER")
+}
+
+/// Bounded content probe for a generic `.xml` whose name does not already say
+/// "crashcontext". Only crash-context XML may wake the app.
+fn xml_contains_crash_context(path: &Path) -> bool {
+    use std::io::Read;
+
+    const PROBE_BYTES: usize = 4096;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0u8; PROBE_BYTES];
+    let Ok(read) = file.read(&mut buffer) else {
+        return false;
+    };
+    String::from_utf8_lossy(&buffer[..read])
+        .to_ascii_lowercase()
+        .contains("<crashcontext")
+}
+
+/// Only a crash artifact may wake the UI. LocalLow is huge and chatty, so it
+/// accepts `Player.log` only; everything else is limited to real crash files.
+pub(crate) fn is_relevant_watch_path(path: &Path) -> bool {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+
+    if has_component(path, "LocalLow") {
+        return name == "player.log";
+    }
+    if has_component(path, "CrashDumps") {
+        return name.ends_with(".dmp");
+    }
+
+    let xml = name.ends_with(".xml") || name.ends_with(".runtime-xml");
+    if in_saved_crashes(path) {
+        // UE puts .log/.dmp and CrashContext XML inside its per-crash folder.
+        return name.ends_with(".wer") || xml || name.ends_with(".log") || name.ends_with(".dmp");
+    }
+
+    name.ends_with(".wer")
+        || (xml && (name.contains("crashcontext") || xml_contains_crash_context(path)))
+}
+
+/// Exact folders worth watching. Never the whole `%LOCALAPPDATA%`: that would
+/// wake the app for browser caches and every unrelated log write.
+fn watch_directories() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let local = dirs::data_local_dir();
+
+    if let Some(local) = &local {
+        let wer = local.join("Microsoft").join("Windows").join("WER");
+        dirs.push(wer.join("ReportArchive"));
+        dirs.push(wer.join("ReportQueue"));
+        dirs.push(local.join("CrashDumps"));
+        if let Some(appdata) = local.parent() {
+            dirs.push(appdata.join("LocalLow"));
+        }
+        // A UE game keeps its crash dumps in <game>\Saved\Crashes, up to
+        // three levels below LocalAppData. The walk itself skips errors.
+        for entry in WalkDir::new(local).max_depth(3).into_iter().flatten() {
+            if entry.file_type().is_dir() && is_saved_crashes_dir(entry.path()) {
+                dirs.push(entry.path().to_path_buf());
+            }
+        }
+    }
+
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let wer = program_data.join("Microsoft").join("Windows").join("WER");
+    dirs.push(wer.join("ReportArchive"));
+    dirs.push(wer.join("ReportQueue"));
+
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.to_string_lossy().to_ascii_lowercase()));
+    dirs
 }
 
 const HARDWARE_MARKERS: &[&str] = &[
@@ -85,26 +217,39 @@ pub struct App {
     /// A day/Rescan click during a scan is replayed instead of dropped.
     rescan_queued: bool,
     receiver: Option<Receiver<(Analysis, SystemContext)>>,
+    /// Filesystem watcher for the exact crash folders in `watch_directories`.
+    watcher: Option<RecommendedWatcher>,
+    /// Every watcher event, drained on each frame.
+    watch_rx: Option<Receiver<notify::Event>>,
+    /// Set only by a relevant crash artifact; one rescan after 1.5 s.
+    debounce_deadline: Option<Instant>,
+    /// True when at least one crash folder is actively watched.
+    watching_active: bool,
     hidden_apps: Vec<String>,
     filter: IncidentFilter,
     search_query: String,
 }
 
 fn install_system_fonts(ctx: &egui::Context) {
-    let candidates: [(&str, &str, FontFamily); 2] = [
+    let fonts_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    let candidates: [(&str, PathBuf, FontFamily); 2] = [
         (
             "SegoeUI",
-            r"C:\Windows\Fonts\segoeui.ttf",
+            fonts_dir.join("segoeui.ttf"),
             FontFamily::Proportional,
         ),
         (
             "Consolas",
-            r"C:\Windows\Fonts\consola.ttf",
+            fonts_dir.join("consola.ttf"),
             FontFamily::Monospace,
         ),
     ];
     for (name, path, family) in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
+        if let Ok(bytes) = std::fs::read(&path) {
             ctx.add_font(FontInsert {
                 name: name.to_owned(),
                 data: FontData::from_owned(bytes),
@@ -138,27 +283,35 @@ impl App {
             path: None,
             pending: None,
             pending_path: None,
-            status: "Drop a crash folder, .wer, .xml or .log to begin.".to_owned(),
+            status: "Drop a crash folder, .wer, .xml, .log or user-mode .dmp to begin.".to_owned(),
             logo: Some(logo),
             copied: false,
             scanning: false,
             rescan_queued: false,
             receiver: None,
+            watcher: None,
+            watch_rx: None,
+            debounce_deadline: None,
+            watching_active: false,
             hidden_apps: Vec::new(),
             filter: IncidentFilter::default(),
             search_query: String::new(),
         };
+        app.start_watcher(cc.egui_ctx.clone());
         app.start_scan();
         app
     }
 
-    /// Root of the next scan: a dropped path wins over the previous root.
-    fn next_root(&mut self) -> PathBuf {
-        self.pending_path
-            .take()
-            .or_else(|| self.path.clone())
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_default()
+    /// Root of the next scan plus whether it came from the user. A local scan
+    /// leaves `path` empty so watcher events can still trigger a rescan.
+    fn next_root(&mut self) -> (PathBuf, bool) {
+        if let Some(dropped) = self.pending_path.take() {
+            return (dropped, true);
+        }
+        if let Some(manual) = self.path.clone() {
+            return (manual, true);
+        }
+        (dirs::data_local_dir().unwrap_or_default(), false)
     }
 
     /// Launch the read-only scan on a background thread so the window opens instantly.
@@ -168,8 +321,12 @@ impl App {
             return;
         }
         self.rescan_queued = false;
-        let root = self.next_root();
-        self.path = Some(root.clone());
+        let (root, manual) = self.next_root();
+        self.path = if manual { Some(root.clone()) } else { None };
+        if manual {
+            // A manual drop owns the view: kill any watcher-triggered rescan.
+            self.debounce_deadline = None;
+        }
         let (tx, rx) = channel();
         self.receiver = Some(rx);
         self.scanning = true;
@@ -181,6 +338,81 @@ impl App {
             let analysis = crate::analyze_with_context(&root, &ctx);
             let _ = tx.send((analysis, ctx));
         });
+    }
+
+    /// Watch only the exact crash folders; missing or denied ones are skipped.
+    fn start_watcher(&mut self, repaint: egui::Context) {
+        let (tx, rx) = channel::<notify::Event>();
+        let Ok(mut watcher) =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    // Redraw only for crash artifacts, never for cache noise.
+                    if event.paths.iter().any(|path| is_relevant_watch_path(path)) {
+                        repaint.request_repaint();
+                    }
+                    let _ = tx.send(event);
+                }
+            })
+        else {
+            self.watcher = None;
+            self.watch_rx = None;
+            self.watching_active = false;
+            return;
+        };
+
+        let mut watching_active = false;
+        for dir in watch_directories() {
+            if !dir.is_dir() {
+                continue;
+            }
+            let mode = if has_component(&dir, "LocalLow")
+                || is_saved_crashes_dir(&dir)
+                || is_wer_dir(&dir)
+            {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if watcher.watch(&dir, mode).is_ok() {
+                watching_active = true;
+            }
+        }
+
+        self.watcher = Some(watcher);
+        self.watch_rx = Some(rx);
+        self.watching_active = watching_active;
+    }
+
+    /// Drain every watcher event. Only a relevant artifact in local mode may
+    /// arm the debounce; a manually opened crash must never be overwritten.
+    fn poll_watcher(&mut self, ctx: &egui::Context) {
+        if self.watcher.is_none() {
+            return;
+        }
+        let mut relevant = false;
+        if let Some(receiver) = &self.watch_rx {
+            while let Ok(event) = receiver.try_recv() {
+                if self.path.is_none()
+                    && event.paths.iter().any(|path| is_relevant_watch_path(path))
+                {
+                    relevant = true;
+                }
+            }
+        }
+
+        if relevant {
+            self.debounce_deadline = Some(Instant::now() + StdDuration::from_millis(1500));
+        }
+
+        if let Some(deadline) = self.debounce_deadline {
+            if Instant::now() >= deadline && !self.scanning {
+                self.debounce_deadline = None;
+                self.start_scan();
+            } else {
+                // Keep the debounce alive even while a scan is still running.
+                ctx.request_repaint_after(StdDuration::from_millis(250));
+            }
+        }
     }
 
     fn finish_scan(&mut self, analysis: Analysis, ctx: SystemContext) {
@@ -235,13 +467,21 @@ impl App {
 
     fn visible_incidents(&self) -> Vec<crate::model::Incident> {
         match &self.analysis {
-            Analysis::Results { incidents, .. } => incidents
-                .iter()
-                .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
-                .filter(|incident| self.incident_in_period(incident))
-                .filter(|incident| self.matches_filter(incident))
-                .cloned()
-                .collect(),
+            Analysis::Results { incidents, .. } => {
+                // Frequency must count repeats inside the selected day window,
+                // but before hidden apps, category and search narrow the list.
+                let mut period: Vec<crate::model::Incident> = incidents
+                    .iter()
+                    .filter(|incident| self.incident_in_period(incident))
+                    .cloned()
+                    .collect();
+                crate::correlate::attach_frequencies(&mut period);
+                period
+                    .into_iter()
+                    .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
+                    .filter(|incident| self.matches_filter(incident))
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -268,10 +508,16 @@ impl App {
         }
         let older = self.older_incidents_count();
         if older > 0 {
+            let suggestion = if self.days == Some(30) {
+                "try All"
+            } else {
+                "try 30d or All"
+            };
             return format!(
-                "No incidents in last {}d ({} older found - try 30d or All)",
+                "No incidents in last {}d ({} older found - {})",
                 self.days.unwrap_or(0),
-                older
+                older,
+                suggestion
             );
         }
         "No incidents match the current filter/search.".to_owned()
@@ -313,6 +559,13 @@ impl App {
             });
 
             if ui.button("Rescan").clicked() {
+                self.start_scan();
+            }
+            if self.path.is_some() && ui.button("Return to local PC").clicked() {
+                self.path = None;
+                self.pending_path = None;
+                self.rescan_queued = false;
+                self.debounce_deadline = None;
                 self.start_scan();
             }
             for (days, label) in [
@@ -361,7 +614,11 @@ impl App {
                 warning_badge(ui, note, "Non-default TDR registry value (read-only).");
             }
             if let Some(warning) = &self.ctx.disk_warn {
-                warning_badge(ui, warning, "Low free space on C: or the pagefile drive.");
+                warning_badge(
+                    ui,
+                    warning,
+                    "Low free space on the system drive or a dynamic pagefile drive.",
+                );
             }
         });
     }
@@ -424,17 +681,24 @@ impl App {
                 .first()
                 .map(|finding| finding.verdict.as_str())
                 .unwrap_or("no verdict");
+            let repeat = if incident.repeat_count > 1 {
+                format!(" [x{}]", incident.repeat_count)
+            } else {
+                String::new()
+            };
             let label = if verdict == incident.title {
                 format!(
-                    "{}  {}",
+                    "{}  {}{}",
                     incident.time.format("%m-%d %H:%M:%S"),
-                    incident.title
+                    incident.title,
+                    repeat
                 )
             } else {
                 format!(
-                    "{}  {}\n{}",
+                    "{}  {}{}\n{}",
                     incident.time.format("%m-%d %H:%M:%S"),
                     incident.title,
+                    repeat,
                     verdict
                 )
             };
@@ -461,7 +725,7 @@ impl App {
             Analysis::NoAnchor { note } => {
                 ui.heading("No crash anchor found");
                 ui.label(
-                    "Drop a crash folder, Report.wer, CrashContext.runtime-xml or Player.log.",
+                    "Drop a crash folder, Report.wer, CrashContext.runtime-xml, Player.log or a user-mode .dmp.",
                 );
                 if let Some(note) = note {
                     ui.label(RichText::new(note.as_str()).small().weak());
@@ -494,6 +758,9 @@ impl App {
         let hide_key = app_key(&incident.title);
 
         ui.heading(incident.time.format("%Y-%m-%d %H:%M:%S").to_string());
+        if let Some(frequency) = crate::report::frequency_label(incident) {
+            ui.label(RichText::new(frequency).small().weak());
+        }
         ui.horizontal(|ui| {
             ui.label(RichText::new(&incident.title).weak());
             if ui.small_button("Hide events from this app").clicked() {
@@ -587,11 +854,15 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.label(format!(
-            "Read-Only | 0 Admin | No Drivers | No .dmp in v{}",
+            "Read-Only | 0 Admin | No Drivers | User-space .dmp | v{}",
             env!("CARGO_PKG_VERSION")
         ));
         ui.separator();
         ui.label(&self.status);
+        if self.watching_active && self.path.is_none() {
+            ui.separator();
+            ui.label(RichText::new("Watching crash folders").small().weak());
+        }
         ui.separator();
         ui.label(format!(
             "Showing {} / {} incident(s)",
@@ -633,6 +904,7 @@ impl eframe::App for App {
             }
             Some(Err(TryRecvError::Empty)) | None => {}
         }
+        self.poll_watcher(ui.ctx());
         if self.scanning {
             ui.ctx()
                 .request_repaint_after(StdDuration::from_millis(120));
@@ -717,6 +989,8 @@ mod tests {
                 link: None,
                 note: None,
             }],
+            repeat_count: 1,
+            first_seen: None,
         }
     }
 
@@ -756,6 +1030,10 @@ mod tests {
             scanning: false,
             rescan_queued: false,
             receiver: None,
+            watcher: None,
+            watch_rx: None,
+            debounce_deadline: None,
+            watching_active: false,
             hidden_apps: Vec::new(),
             filter: IncidentFilter::default(),
             search_query: String::new(),
@@ -782,6 +1060,64 @@ mod tests {
             Some(PathBuf::from("old-root")),
             "finish_scan must not overwrite a pending drop"
         );
-        assert_eq!(app.next_root(), PathBuf::from("new-root"));
+        assert_eq!(
+            app.next_root(),
+            (PathBuf::from("new-root"), true),
+            "a dropped path is a manual root"
+        );
+    }
+
+    #[test]
+    fn watcher_accepts_only_crash_artifacts() {
+        for path in [
+            r"Local\Microsoft\Windows\WER\ReportArchive\Report.wer",
+            r"Local\MyGame\Saved\Crashes\CrashContext.runtime-xml",
+            r"LocalLow\Studio\Game\Player.log",
+            r"Local\CrashDumps\game.exe.1234.dmp",
+        ] {
+            assert!(
+                is_relevant_watch_path(Path::new(path)),
+                "must accept {path}"
+            );
+        }
+
+        for path in [
+            r"Local\Google\Chrome\User Data\Default\Cache\f_000001",
+            r"Local\Temp\something.tmp",
+            r"Local\Docs\notes.txt",
+            r"LocalLow\Studio\other.log",
+        ] {
+            assert!(
+                !is_relevant_watch_path(Path::new(path)),
+                "must reject {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_context_xml_is_detected_by_content_when_the_name_is_generic() {
+        let unique = format!(
+            "framefault-watch-{}-{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+
+        std::fs::write(
+            &path,
+            "<CrashContext><ErrorMessage>boom</ErrorMessage></CrashContext>",
+        )
+        .expect("write crash context");
+        let accepted = is_relevant_watch_path(&path);
+
+        std::fs::write(&path, "<notes>nothing to see</notes>").expect("write notes");
+        let rejected = is_relevant_watch_path(&path);
+
+        let _ = std::fs::remove_file(&path);
+        assert!(accepted, "content with <CrashContext> must be accepted");
+        assert!(!rejected, "ordinary XML must be rejected");
     }
 }

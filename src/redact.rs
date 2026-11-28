@@ -7,8 +7,11 @@ pub fn redact(input: &str) -> String {
     out = mask_file_urls(&out);
     out = mask_profile_paths(&out);
     out = mask_emails(&out);
+    out = mask_steam_ids(&out);
+    out = mask_keyed_ids(&out);
     out = mask_guid(&out);
     out = mask_hex_ids(&out);
+    out = mask_mac(&out);
     out = mask_sid(&out);
     out = mask_ipv6(&out);
     out = mask_ipv4(&out);
@@ -189,6 +192,144 @@ fn mask_hex_ids(input: &str) -> String {
     out
 }
 
+/// SteamID64 is always 17 digits and starts with the public universe prefix.
+fn mask_steam_ids(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+            let boundary_before = start == 0 || !is_token_char(chars[start - 1]);
+            let boundary_after = i == chars.len() || !is_token_char(chars[i]);
+            if token.len() == 17
+                && token.starts_with("7656119")
+                && boundary_before
+                && boundary_after
+            {
+                out.push_str("[REDACTED-STEAMID]");
+            } else {
+                out.push_str(&token);
+            }
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Account identifiers after a labelled key, whatever their length/format.
+fn mask_keyed_ids(input: &str) -> String {
+    const KEYS: [&str; 3] = ["LoginId=", "AccountId=", "SteamId="];
+    const REPLACEMENT: &str = "[REDACTED-ID]";
+    let mut out = input.to_string();
+    for key in KEYS {
+        let mut cursor = 0usize;
+        while let Some(relative) = find_ascii_ci(&out, key, cursor) {
+            let boundary_ok = relative == 0
+                || !out[..relative]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_token_char);
+            if !boundary_ok {
+                cursor = relative + key.len();
+                continue;
+            }
+            let after_key = relative + key.len();
+            let rest = &out[after_key..];
+            let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            let mut value_start = after_key + skipped;
+            if out
+                .as_bytes()
+                .get(value_start)
+                .is_some_and(|byte| matches!(byte, b'"' | b'\''))
+            {
+                value_start += 1;
+            }
+            let value_end = out[value_start..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+                .map(|offset| value_start + offset)
+                .unwrap_or(out.len());
+            if value_end == value_start {
+                cursor = value_start;
+                continue;
+            }
+            out.replace_range(value_start..value_end, REPLACEMENT);
+            cursor = value_start + REPLACEMENT.len();
+        }
+    }
+    out
+}
+
+/// An all-digit MAC is only masked when a "MAC"/"Physical" label is nearby;
+/// this keeps dates/times such as 26-11-27-10-11-12 intact.
+fn has_mac_context(chars: &[char], start: usize, end: usize) -> bool {
+    let before_start = start.saturating_sub(32);
+    let after_end = (end + 32).min(chars.len());
+    let before: String = chars[before_start..start].iter().collect();
+    let after: String = chars[end..after_end].iter().collect();
+    [before, after].iter().any(|text| {
+        text.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|word| word == "mac" || word == "physical")
+    })
+}
+
+/// Dash- or colon-separated MAC address (`AA-BB-CC-DD-EE-FF` / `AA:BB:CC:DD:EE:FF`).
+fn mask_mac(input: &str) -> String {
+    const REPLACEMENT: &str = "[REDACTED-MAC]";
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        // Reject mid-sequence starts too: an IPv6 address must never be eaten
+        // from its middle as a "MAC".
+        let boundary_before =
+            i == 0 || (!is_token_char(chars[i - 1]) && !matches!(chars[i - 1], '-' | ':'));
+        let candidate = mac_end(&chars, i, '-').or_else(|| mac_end(&chars, i, ':'));
+        if let Some(end) = candidate.filter(|_| boundary_before) {
+            let has_letter = chars[i..end]
+                .iter()
+                .any(|character| character.is_ascii_alphabetic());
+            let boundary_after = end == chars.len()
+                || (!is_token_char(chars[end]) && !matches!(chars[end], '-' | ':'));
+            if boundary_after && (has_letter || has_mac_context(&chars, i, end)) {
+                out.push_str(REPLACEMENT);
+                i = end;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Returns the end index of a six-group, two-hex-digit MAC starting at `start`.
+fn mac_end(chars: &[char], start: usize, separator: char) -> Option<usize> {
+    let mut i = start;
+    for group in 0..6 {
+        if group > 0 {
+            if chars.get(i) != Some(&separator) {
+                return None;
+            }
+            i += 1;
+        }
+        let first = *chars.get(i)?;
+        let second = *chars.get(i + 1)?;
+        if !first.is_ascii_hexdigit() || !second.is_ascii_hexdigit() {
+            return None;
+        }
+        i += 2;
+    }
+    Some(i)
+}
+
 /// Masks the whole UNC path, including every directory and file name after
 /// the share — otherwise the last component can still be a username.
 fn mask_unc_servers(input: &str) -> String {
@@ -224,22 +365,93 @@ fn is_ipv6_char(c: char) -> bool {
     c.is_ascii_hexdigit() || c == ':' || c == '.'
 }
 
-/// `HH:MM:SS` and `C:\...` have too few colons; a MAC-like `10de:1b06` has
-/// one. Real IPv6 has `::` or at least three colons plus hex groups.
+fn is_hex_group(group: &str) -> bool {
+    !group.is_empty() && group.len() <= 4 && group.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_ipv4_tail(group: &str) -> bool {
+    let parts: Vec<&str> = group.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.chars().all(|c| c.is_ascii_digit())
+                && part.parse::<u8>().is_ok()
+        })
+}
+
+/// Strict IPv6 validation. `HH:MM:SS`, `1.02:03:04` and dash/colon MACs are
+/// deliberately rejected; only a real address may be redacted.
 fn is_ipv6_address(token: &str) -> bool {
-    let colons = token.chars().filter(|&c| c == ':').count();
-    if !(token.contains("::") || colons >= 3) || !token.chars().any(|c| c.is_ascii_hexdigit()) {
+    if token.is_empty() {
         return false;
     }
-    // A doubled colon after a drive letter ("E:: 6.4 GiB free") is not an
-    // address: require real groups on both sides of `::` (or a leading `::`).
-    if let Some(pos) = token.find("::") {
-        let right = &token[pos + 2..];
-        if right.is_empty() && !token.starts_with("::") {
+
+    if token.contains("::") {
+        // Only one `::` compression marker is legal.
+        if token.matches("::").count() != 1 {
             return false;
         }
+        let Some((left, right)) = token.split_once("::") else {
+            return false;
+        };
+        let left_groups: Vec<&str> = if left.is_empty() {
+            Vec::new()
+        } else {
+            left.split(':').collect()
+        };
+        let right_groups: Vec<&str> = if right.is_empty() {
+            Vec::new()
+        } else {
+            right.split(':').collect()
+        };
+        if left_groups.iter().any(|group| group.is_empty())
+            || right_groups.iter().any(|group| group.is_empty())
+        {
+            return false;
+        }
+        // Keep `E:: 6.4 GiB free` out; a trailing `::` needs real groups,
+        // unless the token is the unspecified address `::`.
+        if right.is_empty() && !token.starts_with("::") && left_groups.len() < 2 {
+            return false;
+        }
+
+        let groups: Vec<&str> = left_groups
+            .iter()
+            .chain(right_groups.iter())
+            .copied()
+            .collect();
+        if groups.is_empty() {
+            return true; // "::"
+        }
+
+        let mut slots = 0usize;
+        for (index, group) in groups.iter().enumerate() {
+            let is_last = index + 1 == groups.len();
+            if is_last && group.contains('.') {
+                // A dotted tail is allowed only as a valid 4-octet IPv4.
+                if !is_ipv4_tail(group) {
+                    return false;
+                }
+                slots += 2;
+            } else {
+                if group.contains('.') || !is_hex_group(group) {
+                    return false;
+                }
+                slots += 1;
+            }
+        }
+        return slots <= 7;
     }
-    true
+
+    let groups: Vec<&str> = token.split(':').collect();
+    match groups.len() {
+        // Eight 1..=4 hex groups.
+        8 => groups.iter().all(|group| is_hex_group(group)),
+        // Six hex groups plus an IPv4 tail.
+        7 => groups[..6].iter().all(|group| is_hex_group(group)) && is_ipv4_tail(groups[6]),
+        _ => false,
+    }
 }
 
 fn mask_ipv6(input: &str) -> String {
@@ -253,8 +465,12 @@ fn mask_ipv6(input: &str) -> String {
                 i += 1;
             }
             let token: String = chars[start..i].iter().collect();
-            if is_ipv6_address(&token) {
+            // A sentence-final period belongs outside the redaction marker.
+            let core = token.trim_end_matches('.');
+            let suffix = &token[core.len()..];
+            if is_ipv6_address(core) {
                 out.push_str("[REDACTED-IPV6]");
+                out.push_str(suffix);
             } else {
                 out.push_str(&token);
             }
@@ -467,6 +683,18 @@ mod tests {
     }
 
     #[test]
+    fn durations_and_times_survive_but_colon_macs_still_mask() {
+        assert_eq!(redact("1.02:03:04"), "1.02:03:04");
+        assert_eq!(redact("17:17:46"), "17:17:46");
+        assert_eq!(redact("AA:BB:CC:DD:EE:FF"), "[REDACTED-MAC]");
+        assert_eq!(redact("00:1a:2b:3c:4d:5e"), "[REDACTED-MAC]");
+        assert_eq!(redact("MAC 11:22:33:44:55:66"), "MAC [REDACTED-MAC]");
+
+        // Full IPv6 still masks; a sentence-final period stays outside.
+        assert_eq!(redact("fe80::1."), "[REDACTED-IPV6].");
+    }
+
+    #[test]
     fn keeps_hardware_facts() {
         let out = redact("AppVersion=2026.4.0.0 ModuleVersion=10.0.26100.10068");
         assert!(
@@ -550,5 +778,55 @@ mod tests {
         assert_eq!(out, "[REDACTED-UNC]");
         assert!(!out.contains("NAS"), "UNC server must be destroyed: {out}");
         assert!(!out.contains("user"), "UNC tail must be destroyed: {out}");
+    }
+
+    #[test]
+    fn steam_ids_and_keyed_accounts_are_masked() {
+        let out = redact("76561198012345678");
+        assert_eq!(out, "[REDACTED-STEAMID]");
+
+        let out = redact("SteamId=76561198012345678 LoginId=abc123 AccountId=42");
+        assert!(out.contains("SteamId=[REDACTED-STEAMID]"), "{out}");
+        assert!(out.contains("LoginId=[REDACTED-ID]"), "{out}");
+        assert!(out.contains("AccountId=[REDACTED-ID]"), "{out}");
+        assert!(!out.contains("7656119"), "{out}");
+        assert!(!out.contains("abc123"), "{out}");
+
+        // A 17-digit number without the Steam prefix is not a SteamID64.
+        let other = "12345678901234567";
+        assert_eq!(redact(other), other);
+    }
+
+    #[test]
+    fn quoted_and_spaced_keyed_ids_are_masked() {
+        let out = redact("LoginId=\"abc123\" AccountId= 42 SteamId='76561198012345678'");
+        assert!(out.contains("LoginId=\"[REDACTED-ID]\""), "{out}");
+        assert!(out.contains("AccountId= [REDACTED-ID]"), "{out}");
+        assert!(out.contains("SteamId='[REDACTED-STEAMID]'"), "{out}");
+        assert!(!out.contains("abc123"), "{out}");
+    }
+
+    #[test]
+    fn dash_separated_mac_addresses_are_masked() {
+        let out = redact("MAC AA-BB-CC-DD-EE-FF and 00-1a-2b-3c-4d-5e");
+        assert_eq!(out.matches("[REDACTED-MAC]").count(), 2, "{out}");
+        for leaked in ["AA-BB", "00-1a"] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+
+        let keep = "2026-11-20 17:17:46 | 1234-5678 | driver 1.2.3.4";
+        assert_eq!(redact(keep), keep, "dates/versions must survive: {out}");
+    }
+
+    #[test]
+    fn numeric_dates_are_not_mistaken_for_macs() {
+        let date = "26-11-27-10-11-12";
+        assert_eq!(redact(date), date);
+
+        assert_eq!(redact("MAC 11-22-33-44-55-66"), "MAC [REDACTED-MAC]");
+        assert_eq!(
+            redact("Physical Address: 11-22-33-44-55-66"),
+            "Physical Address: [REDACTED-MAC]"
+        );
     }
 }

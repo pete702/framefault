@@ -28,6 +28,7 @@ pub fn analyze_with_context(root: &Path, ctx: &SystemContext) -> Analysis {
     signals.extend(sources::wer::scan(root));
     signals.extend(sources::ue::scan(root));
     signals.extend(sources::gamelog::scan(root));
+    signals.extend(sources::dmp::scan(root));
 
     #[cfg(feature = "evtx")]
     if root.is_file()
@@ -72,6 +73,8 @@ pub fn self_test() -> Result<(), String> {
                 link: None,
                 note: None,
             }],
+            repeat_count: 1,
+            first_seen: None,
         }],
         note: None,
     };

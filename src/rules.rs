@@ -125,6 +125,9 @@ impl Rule {
         if self.id == "application_error_1000" {
             return headline(signal).unwrap_or_else(|| self.verdict.clone());
         }
+        if self.id == "dmp_crash" {
+            return headline(signal).unwrap_or_else(|| self.verdict.clone());
+        }
         // Kernel-Power 41 is a BSOD only when Windows recorded a non-zero
         // bugcheck code. Code 0 (or no code) is a plain sudden power loss
         // and must keep the rule's own verdict.
@@ -152,6 +155,9 @@ fn detail_field(detail: &str, label: &str) -> Option<String> {
 
 /// Short, human headline for Application Error 1000: process, code, module.
 pub fn headline(signal: &crate::model::Signal) -> Option<String> {
+    if signal.source == "dmp" {
+        return dmp_headline(signal);
+    }
     let app = signal
         .get("FaultingApplicationName")
         .or_else(|| signal.get("ApplicationName"))
@@ -188,6 +194,18 @@ pub fn headline(signal: &crate::model::Signal) -> Option<String> {
         return Some(format!("{process} - {raw_code} ({module})"));
     }
     Some(format!("{process} - ? ({module})"))
+}
+
+/// Minidump headline: faulting module plus the decoded exception code.
+fn dmp_headline(signal: &crate::model::Signal) -> Option<String> {
+    let raw = signal.get("ExceptionCode")?;
+    let code = crate::codes::parse_exception_code(raw)?;
+    let (name, _) = crate::codes::decode_exception(code);
+    let module = signal
+        .get("FaultingModule")
+        .or_else(|| (!signal.provider.is_empty()).then_some(signal.provider.as_str()))
+        .unwrap_or("Minidump");
+    Some(format!("{module} - 0x{code:08X} {name}"))
 }
 
 /// Decimal code after an explicit BugcheckCode label; `=` and `:` are valid

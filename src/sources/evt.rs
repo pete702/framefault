@@ -89,20 +89,13 @@ pub fn read_recent() -> Vec<Signal> {
     Vec::new()
 }
 
-/// Event XML stores `2026-11-15T12:58:17.2999703Z`; the header only needs minutes.
+/// Event XML stores `2026-11-15T12:58:17.2999703Z` in UTC; the header needs
+/// the same Local time as the event list, not the raw UTC slice.
 fn short_time(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    if bytes.len() >= 16
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && bytes.get(10) == Some(&b'T')
-        && bytes[11..13].iter().all(u8::is_ascii_digit)
-        && bytes.get(13) == Some(&b':')
-        && bytes[14..16].iter().all(u8::is_ascii_digit)
-    {
-        return format!("{} {}", &raw[..10], &raw[11..16]);
+    match parse_time(raw) {
+        Some(time) => time.format("%Y-%m-%d %H:%M").to_string(),
+        None => raw.to_owned(),
     }
-    raw.to_owned()
 }
 
 /// Honest ring-buffer depth, read natively (forward direction = oldest first).
@@ -165,49 +158,128 @@ unsafe fn render_xml(event: windows::Win32::System::EventLog::EVT_HANDLE) -> Opt
     // Render directly into a generous buffer. The two-call ""size probe"" was
     // unreliable for the oldest-record query and produced ""unavailable"".
     let mut buffer = vec![0u8; 131_072];
-    EvtRender(
-        None,
-        event,
-        EvtRenderEventXml.0,
-        buffer.len() as u32,
-        Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
-        &mut used,
-        &mut count,
-    )
-    .ok()?;
-    buffer.truncate(used as usize);
-    let units: Vec<u16> = buffer
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    Some(String::from_utf16_lossy(&units))
+    for _ in 0..3 {
+        match EvtRender(
+            None,
+            event,
+            EvtRenderEventXml.0,
+            buffer.len() as u32,
+            Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut used,
+            &mut count,
+        ) {
+            Ok(()) => {
+                buffer.truncate(used as usize);
+                let units: Vec<u16> = buffer
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                return Some(String::from_utf16_lossy(&units));
+            }
+            // ERROR_INSUFFICIENT_BUFFER (122): `used` is the required size.
+            // Grow the buffer and render again instead of dropping the event.
+            Err(error) if (error.code().0 as u32) & 0xFFFF == 122 => {
+                if used == 0 {
+                    return None;
+                }
+                buffer = vec![0u8; used as usize];
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[cfg(feature = "evtx")]
+fn wevtutil_path() -> std::path::PathBuf {
+    let windows_dir = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .map(std::path::PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    windows_dir.join("System32").join("wevtutil.exe")
 }
 
 #[cfg(feature = "evtx")]
 pub fn scan_evtx(path: &std::path::Path) -> Vec<Signal> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// A stuck wevtutil must not leave the scan thread blocked forever.
+    const WEVTUTIL_TIMEOUT: Duration = Duration::from_secs(10);
+
     // Optional fallback: exported .evtx files are read through wevtutil /lf:true.
     let xpath = format!("*[System[{}]]", IDS);
     let query = format!("/q:{xpath}");
-    let mut command = std::process::Command::new("wevtutil");
-    command.args([
-        "qe",
-        "/lf:true",
-        &path.to_string_lossy(),
-        "/c:300",
-        "/rd:true",
-        "/f:text",
-        query.as_str(),
-    ]);
+    let mut command = Command::new(wevtutil_path());
+    command
+        .args([
+            "qe",
+            "/lf:true",
+            &path.to_string_lossy(),
+            "/c:300",
+            "/rd:true",
+            "/f:xml",
+            query.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    match command.output() {
-        Ok(output) => parse_text(&String::from_utf8_lossy(&output.stdout), "evtx"),
-        Err(_) => Vec::new(),
+
+    let Ok(mut child) = command.spawn() else {
+        return Vec::new();
+    };
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    // Drain both pipes while the process runs, otherwise a full pipe can
+    // deadlock the child before it exits.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut reader = stdout;
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut reader = stderr;
+        let mut buffer = Vec::new();
+        let _ = reader.read_to_end(&mut buffer);
+        buffer
+    });
+
+    let deadline = Instant::now() + WEVTUTIL_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Err(_) => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+        }
+    };
+
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let _ = stderr_reader.join();
+    match status {
+        Some(status) if status.success() => parse_xml(&String::from_utf8_lossy(&stdout), "evtx"),
+        _ => Vec::new(),
     }
 }
 
@@ -487,6 +559,18 @@ mod tests {
             signals[0].t, expected,
             "UTC SystemTime must be converted to Local, not treated as local"
         );
+    }
+
+    #[test]
+    fn ring_buffer_time_is_rendered_in_local_time() {
+        let raw = "2026-11-20T23:30:00.0000000Z";
+        let local = parse_time(raw).expect("fixture timestamp");
+        assert_eq!(
+            short_time(raw),
+            local.format("%Y-%m-%d %H:%M").to_string(),
+            "log_reach must show Local time, not the raw UTC slice"
+        );
+        assert_eq!(short_time("not a timestamp"), "not a timestamp");
     }
 
     #[test]

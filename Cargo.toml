@@ -1,8 +1,8 @@
 [package]
 name = "framefault"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
-description = "One crash verdict per incident — read-only, no-admin Windows game crash diagnostics"
+description = "One crash verdict per incident — read-only, no-admin Windows app and game crash diagnostics"
 license = "MIT"
 
 [dependencies]
@@ -22,6 +22,8 @@ quick-xml = "0.42"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 walkdir = "2"
 dirs = "7"
+notify = "9"
+minidump = "0.27"
 clap = { version = "4", optional = true, features = ["derive"] }
 
 [features]

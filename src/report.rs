@@ -76,6 +76,22 @@ pub const GPU_CONTEXT_MARKERS: &[&str] = &[
     "nvspcap",
 ];
 
+/// Minidumps carry module paths but no loaded-module evidence in the report.
+/// They get GPU context only when a GPU/display module is actually named.
+fn incident_is_dmp(inc: &Incident) -> bool {
+    inc.findings
+        .iter()
+        .flat_map(|finding| &finding.evidence)
+        .any(|line| line.contains("| dmp |"))
+}
+
+fn dmp_has_gpu_modules(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    crate::sources::dmp::GPU_MODULE_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// GPU/display/game context of one incident — used by the UI filter and the
 /// markdown header so the two can never disagree.
 pub fn incident_has_gpu_context(inc: &Incident) -> bool {
@@ -89,7 +105,25 @@ pub fn incident_has_gpu_context(inc: &Incident) -> bool {
             text.push('\n');
         }
     }
-    has_gpu_context_text(&text)
+    if incident_is_dmp(inc) {
+        dmp_has_gpu_modules(&text)
+    } else {
+        has_gpu_context_text(&text)
+    }
+}
+
+/// Repeat line shared by the GUI and the Markdown report. `None` for a
+/// single occurrence, so callers can skip the line entirely.
+pub fn frequency_label(incident: &Incident) -> Option<String> {
+    if incident.repeat_count <= 1 {
+        return None;
+    }
+    let earliest = incident.first_seen.unwrap_or(incident.time);
+    Some(format!(
+        "Frequency: {} times in selected window (earliest: {})",
+        incident.repeat_count,
+        earliest.format("%Y-%m-%d %H:%M:%S")
+    ))
 }
 
 /// Human-readable uptime, shared by the report header and the UI header.
@@ -198,6 +232,10 @@ fn markdown_without_context(analysis: &Analysis) -> String {
                     incident.time.format("%Y-%m-%d %H:%M:%S"),
                     crate::redact::redact(&incident.title)
                 ));
+                if let Some(frequency) = frequency_label(incident) {
+                    out.push_str(&frequency);
+                    out.push_str("\n\n");
+                }
                 for finding in &incident.findings {
                     out.push_str(&format!(
                         "### {} `[{} | {} source(s)]`\n\n",
@@ -240,7 +278,7 @@ fn markdown_without_context(analysis: &Analysis) -> String {
         Analysis::Empty => out.push_str("Nothing to analyse yet.\n"),
     }
     out.push_str(&format!(
-        "---\nGenerated locally by FrameFault v{}. Read-only | 0 Admin | No Drivers.\n",
+        "---\nGenerated locally by FrameFault v{} (https://github.com/pete702/framefault) - Read-only | 0 Admin | No Drivers.\n",
         env!("CARGO_PKG_VERSION")
     ));
     out
@@ -252,7 +290,7 @@ fn redact_safe(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Local;
+    use chrono::{Local, TimeZone};
 
     use super::*;
     use crate::model::Finding;
@@ -271,7 +309,38 @@ mod tests {
                 link: None,
                 note: None,
             }],
+            repeat_count: 1,
+            first_seen: None,
         }
+    }
+
+    #[test]
+    fn repeated_incident_gets_a_frequency_line_in_the_report() {
+        let earliest = Local.with_ymd_and_hms(2026, 11, 20, 9, 30, 0).unwrap();
+        let mut repeated = incident("Game.exe", "GPU driver timeout");
+        repeated.repeat_count = 3;
+        repeated.first_seen = Some(earliest);
+
+        let md = markdown_with_context(
+            &Analysis::Results {
+                incidents: vec![repeated],
+                note: None,
+            },
+            &SystemContext::default(),
+        );
+        assert!(
+            md.contains("Frequency: 3 times in selected window (earliest: 2026-11-20 09:30:00)"),
+            "{md}"
+        );
+
+        let single = markdown_with_context(
+            &Analysis::Results {
+                incidents: vec![incident("Game.exe", "GPU driver timeout")],
+                note: None,
+            },
+            &SystemContext::default(),
+        );
+        assert!(!single.contains("Frequency:"), "{single}");
     }
 
     #[test]
@@ -308,6 +377,10 @@ mod tests {
         );
         assert_eq!(md.matches("## Incident").count(), 1, "{md}");
         assert!(md.contains("> scan note"), "{md}");
+        assert!(
+            md.contains("(https://github.com/pete702/framefault)"),
+            "report footer must link the project: {md}"
+        );
         assert!(
             md.contains(&format!(
                 "Generated locally by FrameFault v{}",
@@ -369,6 +442,31 @@ mod tests {
         assert!(!has_gpu_context_text("EasyAntiCheat BEDaisy"));
         assert!(!has_gpu_context_text("Unreal Unity"));
         assert!(!has_gpu_context_text("C:\\Windows\\System32\\dxgi.dll."));
+    }
+
+    #[test]
+    fn dmp_gpu_context_requires_a_gpu_module() {
+        let mut dmp = incident(
+            "Game.dll - 0xC0000005 ACCESS_VIOLATION",
+            "Game.dll - 0xC0000005 ACCESS_VIOLATION",
+        );
+        dmp.findings[0].evidence.push(
+            "2026-11-25 10:00:00 | dmp | Game.dll | User-mode minidump: 0xC0000005 at 0x10001234"
+                .to_owned(),
+        );
+        assert!(
+            !incident_has_gpu_context(&dmp),
+            "a dump without a GPU module must not get GPU context"
+        );
+
+        dmp.findings[0].evidence.push(
+            "2026-11-25 10:00:01 | dmp | Game.dll | User-mode minidump: GPU modules: nvlddmkm.sys"
+                .to_owned(),
+        );
+        assert!(
+            incident_has_gpu_context(&dmp),
+            "nvlddmkm must enable GPU context for a dump"
+        );
     }
 
     #[test]
@@ -470,7 +568,7 @@ mod tests {
             gpu: "GPU Test".to_owned(),
             hags: "Enabled".to_owned(),
             tdr_note: Some("TdrLevel=0 (recovery disabled!)".to_owned()),
-            disk_warn: Some("Low free space on E:: 6.4 GiB free".to_owned()),
+            disk_warn: Some("Low free space on E: 6.4 GiB free".to_owned()),
             uptime_hours: 200,
             ..Default::default()
         };
@@ -486,7 +584,7 @@ mod tests {
             "{md}"
         );
         assert!(
-            md.contains("- Storage warning: Low free space on E:: 6.4 GiB free"),
+            md.contains("- Storage warning: Low free space on E: 6.4 GiB free"),
             "{md}"
         );
         assert!(md.contains("- HAGS: Enabled"), "{md}");

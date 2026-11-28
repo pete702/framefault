@@ -14,7 +14,7 @@ event_id = 153
 match_field = "detail"
 match_contains = "GPUID"
 weight = 40
-verdict = "NVIDIA GPU driver timeout (TDR) - the game did not crash on its own"
+verdict = "NVIDIA GPU driver timeout (TDR) - the app or game did not crash on its own"
 confidence = "High"
 next_steps = ["Remove GPU and memory overclock/undervolt", "Check the driver version", "Try disabling MPO"]
 link = "https://learn.microsoft.com/en-us/answers/questions/4307117/game-crash-with-the-description-for-event-id-0-fro"
@@ -26,7 +26,7 @@ channel = "System"
 provider_any = ["amdkmdag", "amdwddmg", "amdkmdap"]
 event_id = 153
 weight = 40
-verdict = "AMD GPU driver timeout (TDR) - the game did not crash on its own"
+verdict = "AMD GPU driver timeout (TDR) - the app or game did not crash on its own"
 confidence = "High"
 next_steps = ["Disable overclock/undervolt", "Try WhisperMode or the Adrenalin stability profile", "Check MPO"]
 link = "https://learn.microsoft.com/en-us/answers/questions/4174161/event-id-4101-display-driver-amdwddmg-stopped-resp"
@@ -145,11 +145,48 @@ id = "anticheat_game_log"
 source = "game_log"
 source_any = ["unity_log"]
 match_field = "detail"
-match_any = ["EasyAntiCheat_EOS.sys", "EasyAntiCheat.sys", "BEDaisy.sys", "BattlEye"]
+# gamelog.rs only emits anti-cheat lines with crash context or an exact
+# driver module, so bare names are safe here and catch "EasyAntiCheat error".
+match_any = ["EasyAntiCheat", "BattlEye", "BEDaisy"]
 weight = 25
 verdict = "Anti-cheat driver crash (EasyAntiCheat / BattlEye) - not a game bug"
 confidence = "Medium"
 next_steps = ["Update or reinstall the game's anti-cheat component", "Remove conflicting overlays and hardware-monitoring hooks", "Verify game files and check the anti-cheat service status"]
+
+# ---------------------------------------------------------------------------
+# User-mode minidumps (.dmp) - metadata only, no stack/memory/strings.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "dmp_crash"
+source = "dmp"
+# Kernel PAGEDU64 signals have no ExceptionCode and use their own Info rule.
+match_field = "ExceptionCode"
+weight = 30
+verdict = "User-mode application crash (minidump)"
+confidence = "High"
+link = "https://learn.microsoft.com/en-us/windows/win32/wer/minidump-files"
+
+[[rules]]
+id = "anticheat_dmp"
+source = "dmp"
+match_field = "FaultingModule"
+match_any = ["EasyAntiCheat", "BEDaisy"]
+weight = 25
+verdict = "Anti-cheat driver crash (EasyAntiCheat / BattlEye) - not a game bug"
+confidence = "Medium"
+next_steps = ["Update or reinstall the game's anti-cheat component", "Remove conflicting overlays and hardware-monitoring hooks", "Verify app/game files and check the anti-cheat service status"]
+note = "Faulting module from the user-mode minidump."
+
+[[rules]]
+id = "dmp_kernel_unsupported"
+source = "dmp"
+match_field = "Kind"
+match_value = "kernel"
+weight = 1
+verdict = "Kernel PAGEDU64 dump - not parsed without administrator rights"
+confidence = "Info"
+next_steps = ["Export a user-mode .dmp from the app or game, or use WER/Event Log evidence", "Kernel dumps need admin-only tooling and are intentionally out of scope"]
 
 # ---------------------------------------------------------------------------
 # Hardware
@@ -162,7 +199,7 @@ channel = "System"
 provider = "Microsoft-Windows-WHEA-Logger"
 event_id_any = [17, 18, 19]
 weight = 35
-verdict = "Hardware / PCIe / CPU cache error (WHEA) — check overclock, undervolt, or RAM stability, not the game"
+verdict = "Hardware / PCIe / CPU cache error (WHEA) — check overclock, undervolt, or RAM stability, not the app or game"
 confidence = "High"
 next_steps = ["Check overclock and undervolt", "Run a memory stability test", "Check PCIe power and cables"]
 link = "https://learn.microsoft.com/en-us/answers/questions/3844975/whea-logger-event-id-17-a-corrected-hardware-error"
@@ -217,7 +254,7 @@ source_any = ["unity_log"]
 match_field = "detail"
 match_any = ["DXGI_ERROR_DEVICE_HUNG", "0x887A0006", "DXGI_ERROR_DEVICE_REMOVED", "0x887A0005"]
 weight = 20
-verdict = "Game lost the D3D device after a driver reset"
+verdict = "The app or game lost the D3D device after a driver reset"
 confidence = "High"
 
 [[rules]]
@@ -262,7 +299,7 @@ match_any = [
   "SpecialK64.dll", "dxgi.dll", "d3d12.dll", "d3d11.dll", "nvspcap64.dll"
 ]
 weight = 15
-verdict = "Third-party overlay/proxy DLL loaded into the game at crash time"
+verdict = "Third-party overlay/proxy DLL loaded into the app or game at crash time"
 confidence = "Medium"
 note = "Historical evidence from Report.wer. System32/SysWOW64 DXGI/D3D DLLs are ignored."
 

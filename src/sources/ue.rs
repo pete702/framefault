@@ -25,15 +25,36 @@ const FIELDS: [&str; 10] = [
 
 /// UE5 tag casing varies; all tags are normalised to lowercase here and looked
 /// up case-insensitively in Signal::get. Empty Shipping CallStack is ignored.
+fn is_xml_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+}
+
+/// A file whose name contains "crashcontext" is not enough: read the first
+/// 4 KiB and require the actual root tag before treating it as UE context.
+fn has_crash_context_tag(path: &Path) -> bool {
+    use std::io::Read;
+
+    const PROBE_BYTES: usize = 4096;
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0u8; PROBE_BYTES];
+    let Ok(read) = file.read(&mut buffer) else {
+        return false;
+    };
+    String::from_utf8_lossy(&buffer[..read])
+        .to_ascii_lowercase()
+        .contains("<crashcontext")
+}
+
 pub fn scan(root: &Path) -> Vec<Signal> {
     let files: Vec<PathBuf> = if root.is_file() {
         let name = root.file_name().unwrap_or_default().to_string_lossy();
         // Keep the canonical UE filename (it ends in .runtime-xml, not .xml),
         // and accept any dropped .xml that actually contains CrashContext.
         let canonical = name.eq_ignore_ascii_case("crashcontext.runtime-xml");
-        let is_xml = root
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"));
+        let is_xml = is_xml_file(root);
         let has_crash_context = is_xml
             && fs::read_to_string(root)
                 .map(|text| text.to_ascii_lowercase().contains("<crashcontext"))
@@ -46,9 +67,15 @@ pub fn scan(root: &Path) -> Vec<Signal> {
     } else {
         let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in WalkDir::new(root).max_depth(9).into_iter().flatten() {
-            if entry.file_name().to_string_lossy().to_ascii_lowercase()
-                != "crashcontext.runtime-xml"
-            {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            // The canonical file ends in `.runtime-xml`, not `.xml`. Any other
+            // XML name containing "crashcontext" is also a UE crash report.
+            let canonical = name == "crashcontext.runtime-xml";
+            let xml_named = name.ends_with(".xml") && name.contains("crashcontext");
+            if !(canonical || xml_named) {
+                continue;
+            }
+            if xml_named && !has_crash_context_tag(entry.path()) {
                 continue;
             }
             if let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) {
@@ -162,6 +189,15 @@ mod tests {
         assert_eq!(
             detail_from_map(&map),
             "gamename=Game\nbisoom=true\nerrormessage=boom\n"
+        );
+    }
+
+    #[test]
+    fn directory_scan_ignores_xml_without_the_crash_context_tag() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ue-fake");
+        assert!(
+            scan(&dir).is_empty(),
+            "notes-crashcontext.xml without <CrashContext> must be ignored"
         );
     }
 }
