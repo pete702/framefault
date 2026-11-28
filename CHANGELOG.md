@@ -4,7 +4,7 @@
 
 ### Highlights & UI
 - **Crash frequency.** Repeated identical crashes are counted inside the selected 7d/14d/30d/All window and shown as `[xN]` next to the incident plus a `Frequency: N times ...` line in the details and copied report. Chronological rows are never merged.
-- **Folder watcher.** FrameFault watches the real Windows crash folders — per-user and machine-wide WER queues/archives (recursively), `%LOCALAPPDATA%\CrashDumps`, LocalLow (`Player.log` only) and UE `Saved\Crashes` — and rescans after a 1.5 s debounce. A manually dropped crash is never overwritten; **Return to local PC** switches back.
+- **Folder watcher.** FrameFault watches the real Windows crash folders — per-user and machine-wide WER queues/archives (recursively), `%LOCALAPPDATA%\CrashDumps`, LocalLow (`Player.log` only) and UE `Saved\Crashes` — and rescans after a 1.5 s debounce. A manually dropped crash is never overwritten; **Return to local PC** switches back. Watcher discovery runs off the UI thread, and the visible incident list is cached until an input changes.
 - **Universal scope.** One verdict for Windows apps, GPU drivers, BSODs and PC game crashes, not just games.
 - The status bar now reports `User-space .dmp` instead of claiming dumps are ignored.
 
@@ -14,11 +14,12 @@
 - Kernel `PAGEDU64` dumps are detected safely: skipped in automatic scans and reported as unsupported (admin-only) when dropped explicitly. dmp verdicts decode the exception code and match anti-cheat modules.
 - Minidump events become primary anchors, so a dump-only crash still produces a verdict.
 - DMP GPU context appears only when a GPU/display module (`nvlddmkm`, `amdkmd`, `igdkmd`, `igfx`, `d3d11`, `d3d12`, `dxgi`) is named.
-- WER watchers now recurse into `ReportArchive\<folder>\Report.wer`.
+- WER watchers now recurse into `ReportArchive\<folder>\Report.wer`. A dropped game/crash folder reads only its own `Report*.wer` files; machine-wide WER is scanned only for the default LocalAppData launch.
 
 ### Privacy & Redaction
 - Minidump evidence is limited to exception metadata and non-system module paths; no process memory is read.
 - Reports keep the existing irreversible redaction of profile paths, identifiers and network addresses before the clipboard.
+- Sentence punctuation stays outside email markers; `std::deque`-style identifiers are not mistaken for IPv6; `LoginId = value` with spaces/tabs is masked; drive letters like `E::` survive while `1::` is masked as a real IPv6 address.
 
 ### Build & CI
 - Version 0.2.0. CI keeps `--locked`, formatting, clippy, all-feature tests, pinned third-party actions and least-privilege permissions.

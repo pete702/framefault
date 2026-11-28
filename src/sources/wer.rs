@@ -34,6 +34,12 @@ fn program_data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
 }
 
+/// Only the default LocalAppData launch (or the empty fallback root) may scan
+/// machine-wide WER folders. A dropped folder stays isolated.
+fn is_default_local_root(root: &Path) -> bool {
+    root.as_os_str().is_empty() || dirs::data_local_dir().is_some_and(|dir| dir.as_path() == root)
+}
+
 pub fn scan(root: &Path) -> Vec<Signal> {
     let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
     let mut seen = HashSet::new();
@@ -60,7 +66,7 @@ pub fn scan(root: &Path) -> Vec<Signal> {
     } else {
         // A missing explicit path must not fall back to machine-wide reports.
         // Only the default LocalAppData launch may scan machine WER folders.
-        let is_default_local = dirs::data_local_dir().is_some_and(|dir| dir.as_path() == root);
+        let is_default_local = is_default_local_root(root);
         if !root.exists() && !is_default_local {
             return Vec::new();
         }
@@ -71,15 +77,18 @@ pub fn scan(root: &Path) -> Vec<Signal> {
             }
         }
 
-        // Per-user WER first, then machine-wide. AccessDenied is silently ignored.
-        if let Some(local) = dirs::data_local_dir() {
-            for dir in ["ReportArchive", "ReportQueue"] {
-                collect_wer_dir(&local.join("Microsoft\\Windows\\WER").join(dir), &mut add);
+        // Per-user WER first, then machine-wide. AccessDenied is silently
+        // ignored, and a dropped game/crash folder never pulls in either.
+        if is_default_local {
+            if let Some(local) = dirs::data_local_dir() {
+                for dir in ["ReportArchive", "ReportQueue"] {
+                    collect_wer_dir(&local.join("Microsoft\\Windows\\WER").join(dir), &mut add);
+                }
             }
-        }
-        let programdata = program_data_dir().join(r"Microsoft\Windows\WER");
-        for dir in ["ReportArchive", "ReportQueue"] {
-            collect_wer_dir(&programdata.join(dir), &mut add);
+            let programdata = program_data_dir().join(r"Microsoft\Windows\WER");
+            for dir in ["ReportArchive", "ReportQueue"] {
+                collect_wer_dir(&programdata.join(dir), &mut add);
+            }
         }
     }
 
@@ -280,6 +289,49 @@ mod tests {
     #[test]
     fn missing_root_does_not_fall_back_to_machine_wide_wer() {
         assert!(scan(Path::new(r"Z:\definitely_missing_path_xyz")).is_empty());
+    }
+
+    #[test]
+    fn only_the_default_local_root_may_scan_machine_wide_wer() {
+        assert!(is_default_local_root(Path::new("")));
+        assert!(!is_default_local_root(Path::new(r"Z:\Games\SomeGame")));
+        if let Some(local) = dirs::data_local_dir() {
+            assert!(is_default_local_root(&local));
+        }
+    }
+
+    #[test]
+    fn dropped_folder_scans_only_its_own_reports() {
+        let unique = format!(
+            "framefault-wer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("create temp wer dir");
+        let report = dir.join("Report.wer");
+        std::fs::write(
+            &report,
+            "EventType=ApplicationCrash\r\nReportCreateTimeStamp=2026-11-25T10:00:00\r\nAppName=FrameFaultQaDrop\r\n",
+        )
+        .expect("write wer");
+
+        let signals = scan(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            signals.len(),
+            1,
+            "a dropped folder must not mix machine-wide WER reports"
+        );
+        assert!(
+            signals[0].detail.contains("FrameFaultQaDrop"),
+            "own report must still be read: {}",
+            signals[0].detail
+        );
     }
 
     #[test]

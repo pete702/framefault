@@ -221,6 +221,8 @@ pub struct App {
     watcher: Option<RecommendedWatcher>,
     /// Every watcher event, drained on each frame.
     watch_rx: Option<Receiver<notify::Event>>,
+    /// Watcher construction runs off the UI thread; the result arrives here.
+    watcher_setup: Option<Receiver<(RecommendedWatcher, Receiver<notify::Event>, bool)>>,
     /// Set only by a relevant crash artifact; one rescan after 1.5 s.
     debounce_deadline: Option<Instant>,
     /// True when at least one crash folder is actively watched.
@@ -228,6 +230,10 @@ pub struct App {
     hidden_apps: Vec<String>,
     filter: IncidentFilter,
     search_query: String,
+    /// Day-filtered, frequency-annotated list. Rebuilt only when its inputs
+    /// change, so panels never clone incidents on every frame.
+    cached_visible: Vec<Incident>,
+    cache_dirty: bool,
 }
 
 fn install_system_fonts(ctx: &egui::Context) {
@@ -291,11 +297,14 @@ impl App {
             receiver: None,
             watcher: None,
             watch_rx: None,
+            watcher_setup: None,
             debounce_deadline: None,
             watching_active: false,
             hidden_apps: Vec::new(),
             filter: IncidentFilter::default(),
             search_query: String::new(),
+            cached_visible: Vec::new(),
+            cache_dirty: true,
         };
         app.start_watcher(cc.egui_ctx.clone());
         app.start_scan();
@@ -341,46 +350,75 @@ impl App {
     }
 
     /// Watch only the exact crash folders; missing or denied ones are skipped.
+    /// The directory walk and watcher construction happen off the UI thread so
+    /// the window paints immediately.
     fn start_watcher(&mut self, repaint: egui::Context) {
-        let (tx, rx) = channel::<notify::Event>();
-        let Ok(mut watcher) =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event {
-                    // Redraw only for crash artifacts, never for cache noise.
-                    if event.paths.iter().any(|path| is_relevant_watch_path(path)) {
-                        repaint.request_repaint();
+        let (setup_tx, setup_rx) = channel();
+        self.watcher_setup = Some(setup_rx);
+        std::thread::spawn(move || {
+            let (tx, rx) = channel::<notify::Event>();
+            let Ok(mut watcher) =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    if let Ok(event) = event {
+                        // Redraw only for crash artifacts, never for cache noise.
+                        if event.paths.iter().any(|path| is_relevant_watch_path(path)) {
+                            repaint.request_repaint();
+                        }
+                        let _ = tx.send(event);
                     }
-                    let _ = tx.send(event);
-                }
-            })
-        else {
-            self.watcher = None;
-            self.watch_rx = None;
-            self.watching_active = false;
-            return;
-        };
-
-        let mut watching_active = false;
-        for dir in watch_directories() {
-            if !dir.is_dir() {
-                continue;
-            }
-            let mode = if has_component(&dir, "LocalLow")
-                || is_saved_crashes_dir(&dir)
-                || is_wer_dir(&dir)
-            {
-                RecursiveMode::Recursive
-            } else {
-                RecursiveMode::NonRecursive
+                })
+            else {
+                // Dropping setup_tx signals failure through the channel.
+                return;
             };
-            if watcher.watch(&dir, mode).is_ok() {
-                watching_active = true;
-            }
-        }
 
-        self.watcher = Some(watcher);
-        self.watch_rx = Some(rx);
-        self.watching_active = watching_active;
+            let mut watching_active = false;
+            for dir in watch_directories() {
+                if !dir.is_dir() {
+                    continue;
+                }
+                let mode = if has_component(&dir, "LocalLow")
+                    || is_saved_crashes_dir(&dir)
+                    || is_wer_dir(&dir)
+                {
+                    RecursiveMode::Recursive
+                } else {
+                    RecursiveMode::NonRecursive
+                };
+                if watcher.watch(&dir, mode).is_ok() {
+                    watching_active = true;
+                }
+            }
+
+            let _ = setup_tx.send((watcher, rx, watching_active));
+        });
+    }
+
+    /// Pick up the background watcher exactly once; keep repainting until it
+    /// either arrives or reports failure.
+    fn poll_watcher_setup(&mut self, ctx: &egui::Context) {
+        let received = self
+            .watcher_setup
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+        match received {
+            Some(Ok((watcher, watch_rx, watching_active))) => {
+                self.watcher = Some(watcher);
+                self.watch_rx = Some(watch_rx);
+                self.watching_active = watching_active;
+                self.watcher_setup = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.watcher = None;
+                self.watch_rx = None;
+                self.watching_active = false;
+                self.watcher_setup = None;
+            }
+            Some(Err(TryRecvError::Empty)) => {
+                ctx.request_repaint_after(StdDuration::from_millis(100));
+            }
+            None => {}
+        }
     }
 
     /// Drain every watcher event. Only a relevant artifact in local mode may
@@ -423,6 +461,7 @@ impl App {
         self.selected = 0;
         self.copied = false;
         self.scanning = false;
+        self.cache_dirty = true;
         let count = self.total_incidents();
         self.status = format!(
             "Scanned {count} incident(s) | {}",
@@ -465,25 +504,28 @@ impl App {
         }
     }
 
-    fn visible_incidents(&self) -> Vec<crate::model::Incident> {
-        match &self.analysis {
-            Analysis::Results { incidents, .. } => {
-                // Frequency must count repeats inside the selected day window,
-                // but before hidden apps, category and search narrow the list.
-                let mut period: Vec<crate::model::Incident> = incidents
-                    .iter()
-                    .filter(|incident| self.incident_in_period(incident))
-                    .cloned()
-                    .collect();
-                crate::correlate::attach_frequencies(&mut period);
-                period
-                    .into_iter()
-                    .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
-                    .filter(|incident| self.matches_filter(incident))
-                    .collect()
-            }
-            _ => Vec::new(),
+    /// Rebuild the visible list only when an input changed. Frequency must
+    /// count repeats inside the selected day window, but before hidden apps,
+    /// category and search narrow the list.
+    fn refresh_visible(&mut self) {
+        if !self.cache_dirty {
+            return;
         }
+        let mut period: Vec<Incident> = match &self.analysis {
+            Analysis::Results { incidents, .. } => incidents
+                .iter()
+                .filter(|incident| self.incident_in_period(incident))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        };
+        crate::correlate::attach_frequencies(&mut period);
+        self.cached_visible = period
+            .into_iter()
+            .filter(|incident| !self.hidden_apps.contains(&app_key(&incident.title)))
+            .filter(|incident| self.matches_filter(incident))
+            .collect();
+        self.cache_dirty = false;
     }
 
     fn older_incidents_count(&self) -> usize {
@@ -578,6 +620,7 @@ impl App {
                     self.days = days;
                     self.selected = 0;
                     self.copied = false;
+                    self.cache_dirty = true;
                 }
             }
         });
@@ -640,6 +683,7 @@ impl App {
                     self.filter = filter;
                     self.selected = 0;
                     self.copied = false;
+                    self.cache_dirty = true;
                 }
             }
         });
@@ -653,10 +697,12 @@ impl App {
         if self.search_query != previous_query {
             self.selected = 0;
             self.copied = false;
+            self.cache_dirty = true;
         }
         ui.separator();
 
-        let incidents = self.visible_incidents();
+        self.refresh_visible();
+        let incidents = &self.cached_visible;
         if !self.hidden_apps.is_empty() {
             ui.horizontal(|ui| {
                 ui.label(
@@ -668,6 +714,7 @@ impl App {
                     self.hidden_apps.clear();
                     self.selected = 0;
                     self.copied = false;
+                    self.cache_dirty = true;
                 }
             });
         }
@@ -743,7 +790,10 @@ impl App {
             Analysis::Results { .. } => {}
         }
 
-        let incidents = self.visible_incidents();
+        let incidents = {
+            self.refresh_visible();
+            &self.cached_visible
+        };
         if incidents.is_empty() {
             ui.label(self.empty_incidents_message());
             return;
@@ -769,6 +819,7 @@ impl App {
                 }
                 self.selected = 0;
                 self.copied = false;
+                self.cache_dirty = true;
             }
         });
         ui.add_space(8.0);
@@ -866,7 +917,7 @@ impl App {
         ui.separator();
         ui.label(format!(
             "Showing {} / {} incident(s)",
-            self.visible_incidents().len(),
+            self.cached_visible.len(),
             self.total_incidents()
         ));
         ui.separator();
@@ -904,6 +955,8 @@ impl eframe::App for App {
             }
             Some(Err(TryRecvError::Empty)) | None => {}
         }
+        self.poll_watcher_setup(ui.ctx());
+        self.refresh_visible();
         self.poll_watcher(ui.ctx());
         if self.scanning {
             ui.ctx()
@@ -913,6 +966,8 @@ impl eframe::App for App {
         egui::containers::Panel::top("header").show(ui, |ui| {
             self.header(ui);
         });
+        // A day switch in the header must reach the status bar in this frame.
+        self.refresh_visible();
         egui::containers::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| self.status_bar(ui));
         });
@@ -1032,12 +1087,39 @@ mod tests {
             receiver: None,
             watcher: None,
             watch_rx: None,
+            watcher_setup: None,
             debounce_deadline: None,
             watching_active: false,
             hidden_apps: Vec::new(),
             filter: IncidentFilter::default(),
             search_query: String::new(),
+            cached_visible: Vec::new(),
+            cache_dirty: true,
         }
+    }
+
+    #[test]
+    fn visible_cache_honours_filters_without_recomputing_when_clean() {
+        let mut app = idle_app();
+        app.analysis = Analysis::Results {
+            incidents: vec![bsod_incident()],
+            note: None,
+        };
+        app.refresh_visible();
+        assert_eq!(app.cached_visible.len(), 1);
+        assert!(!app.cache_dirty);
+
+        // No input changed: the cached list is reused untouched.
+        app.refresh_visible();
+        assert_eq!(app.cached_visible.len(), 1);
+
+        app.filter = IncidentFilter::GamesAndGpu;
+        app.cache_dirty = true;
+        app.refresh_visible();
+        assert!(
+            app.cached_visible.is_empty(),
+            "a BSOD must not survive the Games/GPU filter"
+        );
     }
 
     #[test]

@@ -115,6 +115,10 @@ fn is_email_local_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-')
 }
 
+fn is_email_trailing_punctuation(c: char) -> bool {
+    matches!(c, '.' | ',' | ';' | ':' | ')' | '"' | '\'')
+}
+
 fn mask_emails(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -132,13 +136,21 @@ fn mask_emails(input: &str) -> String {
                 {
                     end += 1;
                 }
-                let domain: String = chars[i + 1..end].iter().collect();
+                // Sentence punctuation belongs outside the marker, so validate
+                // the bare domain and re-emit the suffix afterwards.
+                let mut domain_end = end;
+                while domain_end > i + 1 && is_email_trailing_punctuation(chars[domain_end - 1]) {
+                    domain_end -= 1;
+                }
+                let domain: String = chars[i + 1..domain_end].iter().collect();
+                let suffix: String = chars[domain_end..end].iter().collect();
                 let valid = domain.contains('.')
                     && !domain.starts_with('.')
                     && !domain.ends_with('.')
                     && domain.chars().any(|c| c.is_ascii_alphabetic());
                 if valid {
                     out.push_str("[REDACTED-EMAIL]");
+                    out.push_str(&suffix);
                     i = end;
                     continue;
                 }
@@ -223,9 +235,11 @@ fn mask_steam_ids(input: &str) -> String {
     out
 }
 
-/// Account identifiers after a labelled key, whatever their length/format.
+/// Account identifiers after a labelled key (`LoginId`, `AccountId`,
+/// `SteamId`), whatever their length/format. Whitespace/tabs are allowed
+/// before and after `=`.
 fn mask_keyed_ids(input: &str) -> String {
-    const KEYS: [&str; 3] = ["LoginId=", "AccountId=", "SteamId="];
+    const KEYS: [&str; 3] = ["LoginId", "AccountId", "SteamId"];
     const REPLACEMENT: &str = "[REDACTED-ID]";
     let mut out = input.to_string();
     for key in KEYS {
@@ -241,9 +255,17 @@ fn mask_keyed_ids(input: &str) -> String {
                 continue;
             }
             let after_key = relative + key.len();
+            // Optional spaces/tabs before the `=` sign ("LoginId = abc123").
             let rest = &out[after_key..];
+            let before_eq = after_key + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
+            if out.as_bytes().get(before_eq) != Some(&b'=') {
+                cursor = after_key;
+                continue;
+            }
+            let value_base = before_eq + 1;
+            let rest = &out[value_base..];
             let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
-            let mut value_start = after_key + skipped;
+            let mut value_start = value_base + skipped;
             if out
                 .as_bytes()
                 .get(value_start)
@@ -410,10 +432,16 @@ fn is_ipv6_address(token: &str) -> bool {
         {
             return false;
         }
-        // Keep `E:: 6.4 GiB free` out; a trailing `::` needs real groups,
-        // unless the token is the unspecified address `::`.
-        if right.is_empty() && !token.starts_with("::") && left_groups.len() < 2 {
-            return false;
+        // Keep `E:: 6.4 GiB free` out: a trailing `::` with a single drive
+        // letter on the left is a Windows path, not an address. Numeric
+        // groups such as `1::` are a valid compressed IPv6.
+        if right.is_empty() && !token.starts_with("::") && left_groups.len() == 1 {
+            let group = left_groups[0];
+            let drive_letter =
+                group.len() == 1 && group.chars().all(|c| matches!(c, 'A'..='F' | 'a'..='f'));
+            if drive_letter {
+                return false;
+            }
         }
 
         let groups: Vec<&str> = left_groups
@@ -468,7 +496,11 @@ fn mask_ipv6(input: &str) -> String {
             // A sentence-final period belongs outside the redaction marker.
             let core = token.trim_end_matches('.');
             let suffix = &token[core.len()..];
-            if is_ipv6_address(core) {
+            // Never start or end inside an identifier: `std::deque` is a C++
+            // type, not an IPv6 address.
+            let boundary_before = start == 0 || !is_token_char(chars[start - 1]);
+            let boundary_after = i == chars.len() || !is_token_char(chars[i]);
+            if boundary_before && boundary_after && is_ipv6_address(core) {
                 out.push_str("[REDACTED-IPV6]");
                 out.push_str(suffix);
             } else {
@@ -692,6 +724,31 @@ mod tests {
 
         // Full IPv6 still masks; a sentence-final period stays outside.
         assert_eq!(redact("fe80::1."), "[REDACTED-IPV6].");
+    }
+
+    #[test]
+    fn email_punctuation_ipv6_boundaries_and_spaced_keys_are_handled() {
+        // M1: a sentence-final period stays outside the marker.
+        assert_eq!(redact("alice@example.com."), "[REDACTED-EMAIL].");
+        assert_eq!(redact("mail alice@example.com,"), "mail [REDACTED-EMAIL],");
+
+        // L1: C++ identifiers are not IPv6 addresses.
+        for code in ["std::deque", "std::detail", "std::default_delete"] {
+            assert_eq!(redact(code), code, "{code} must stay intact");
+        }
+
+        // L2: optional spaces/tabs before the `=`.
+        assert_eq!(redact("LoginId = abc123"), "LoginId = [REDACTED-ID]");
+        assert_eq!(redact("AccountId\t=\t42"), "AccountId\t=\t[REDACTED-ID]");
+        assert_eq!(
+            redact("SteamId = 76561198012345678"),
+            "SteamId = [REDACTED-STEAMID]"
+        );
+
+        // L3: `1::` is a valid IPv6 address, `E::` is a drive letter.
+        assert_eq!(redact("1::"), "[REDACTED-IPV6]");
+        assert_eq!(redact("E::"), "E::");
+        assert_eq!(redact("1.02:03:04"), "1.02:03:04");
     }
 
     #[test]
